@@ -51,7 +51,9 @@ class TrainingConfig:
     
     # Scheduler
     scheduler_type: str = 'cosine'  # 'cosine', 'step', 'plateau'
-    scheduler_pct_start: float = 0.1
+    scheduler_pct_start: float = 0.9
+    scheduler_div_factor: float = 1
+    scheduler_final_div_factor: float = 1
     min_lr: float = 1e-6
     
     # Early stopping
