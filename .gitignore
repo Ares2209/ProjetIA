@@ -1,1 +1,10 @@
 /Défi-IA-2026
+/venv
+/results
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.ipynb_checkpoints
+logs/
+data/
