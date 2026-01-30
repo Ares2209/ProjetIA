@@ -38,10 +38,10 @@ class ModelConfig:
 class TrainingConfig:
     """Configuration de l'entraînement."""
     num_classes: int = 2  # eau, nuages
-    batch_size: int = 32
-    num_epochs: int = 50
+    batch_size: int = 64
+    num_epochs: int = 500
     learning_rate: float = 1e-3
-    patience: int = 10
+    patience: int = 50
     preload: Optional[str] = None
     
     weight_decay: float = 1e-4
