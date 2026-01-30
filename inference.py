@@ -7,10 +7,7 @@ Usage:
     python inference.py --checkpoint checkpoints/exoplanet_modelbest.pth --index 0
     
 ex : 
-python inference.py   --checkpoint checkpoints/exoplanet_modelbest.pth   
---spectra Défi-IA-2026/DATA/defi-ia-cnes/spectra_test.npy   --auxiliary Défi-IA-2026/DATA/defi-ia-cnes/auxiliar
-y_test.csv   --index 3
-
+python inference.py   --checkpoint checkpoints/exoplanet_modelbest.pth   --spectra Défi-IA-2026/DATA/defi-ia-cnes/spectra.npy   --auxiliary Défi-IA-2026/DATA/defi-ia-cnes/auxiliary.csv   --targets Défi-IA-2026/DATA/defi-ia-cnes/targets.csv   --index 54   --verbose
 
 Options:
     --checkpoint : chemin vers le fichier .pth
