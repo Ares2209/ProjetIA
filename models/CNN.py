@@ -20,7 +20,7 @@ class CNN(nn.Module):
         spectrum_length: int,
         auxiliary_dim: int = 5,
         num_classes: int = 2,
-        input_channels: int = 1,  # NOUVEAU: paramètre pour le nombre de canaux d'entrée
+        input_channels: int = 1, 
         conv_channels: list = [32, 64, 128, 256],
         kernel_sizes: list = [7, 5, 3, 3],
         pool_sizes: list = [2, 2, 2, 2],
