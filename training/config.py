@@ -68,9 +68,6 @@ class TrainingConfig:
     log_every_n_steps: int = 10
     
     # Loss
-    loss_type: str = 'bce'  # 'bce' or 'focal'
-    focal_alpha: float = 0.25
-    focal_gamma: float = 2.0
     pos_weight: Optional[List[float]] = None  # [weight_eau, weight_nuages]
     
     classification_threshold: float = 0.5
