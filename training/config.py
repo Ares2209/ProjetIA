@@ -19,7 +19,7 @@ class ModelConfig:
     fc_dims: List[int] = field(default_factory=lambda: [256, 128])
     
     # Pour ResNetSpectralCNN
-    d_model: int = 64  # initial_channels pour ResNet
+    d_model: int = 128  # initial_channels pour ResNet
     num_layers: int = 2  # num_blocks par layer
     
     # Commun

@@ -62,7 +62,10 @@ def build_dataloaders(config: Config):
         str(spectra_path), 
         str(aux_path), 
         str(targets_path), 
-        is_train=True
+        is_train=True,
+        augmentation_factor=10, 
+        shift_range=0.05,
+        scale_range=0.1
     )
 
     # Split train/val
