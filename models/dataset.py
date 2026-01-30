@@ -44,6 +44,9 @@ class ExoplanetDataset(Dataset):
 
         # Paramètres d'augmentation
         self.augmentation_factor = augmentation_factor
+        if not is_train and augmentation_factor > 0:
+            augmentation_factor = 0
+    
         self.shift_range = shift_range
         self.scale_range = scale_range
         
@@ -86,7 +89,7 @@ class ExoplanetDataset(Dataset):
 
         return item
 
-    def _augment_spectrum(self, spectrum, seed):
+    def _augment_spectrum(self, spectrum, original_idx, aug_version=1):
         """
         Applique plusieurs techniques d'augmentation au spectre
         
@@ -97,6 +100,7 @@ class ExoplanetDataset(Dataset):
         Returns:
             Spectre augmenté de même shape
         """
+        seed = original_idx * 1000 + aug_version
         np.random.seed(seed)
         augmented = spectrum.copy()
         

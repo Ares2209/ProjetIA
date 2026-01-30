@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 # Importer les classes de modèles et le dataset
 from models.CNN import CNN
-from models.ResNetCNN import ResNetSpectralCNN
+from models.ResNetCNN import ResNet1D
 from models.dataset import ExoplanetDataset, collate_fn
 
 def remove_module_prefix(state_dict: dict) -> dict:
@@ -148,11 +148,14 @@ def main():
     _, channels, length = spectrum.shape  # (B, C, L)
     auxiliary_dim = auxiliary.shape[1]
 
-    if model_type == 'resnet':
-        model = ResNetSpectralCNN(
+    if model_type == 'ResNet':
+        model = ResNet1D(
             spectrum_length=length,
             auxiliary_dim=auxiliary_dim,
-            num_classes=2
+            num_classes=2,
+            augmentation_factor=10, 
+            shift_range=0.05,
+            scale_range=0.1
         )
     else:
         # CNN classique
