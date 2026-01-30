@@ -9,13 +9,13 @@ from tqdm import tqdm
 
 class BinaryClassificationLoss(nn.Module):
     """
-    Binary Cross Entropy Loss pour classification multi-label.
+    Binary Cross Entropy Loss (BCE) pour classification multi-label.
     
     Conçue pour prédire simultanément la présence/absence de:
     - Eau (classe 0)
     - Nuages (classe 1)
     
-    Formule: BCE = -[y*log(p) + (1-y)*log(1-p)]
+    Formule: BCE = -[y*log(p) + (1-y)*log(1-p)] <= vu en cours, Focal loss c'est bien aussi mais si déséquilibre
     où:
         y = label vrai (0 ou 1)
         p = probabilité prédite (après sigmoid)

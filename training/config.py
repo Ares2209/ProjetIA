@@ -9,10 +9,10 @@ import torch
 @dataclass
 class ModelConfig:
     """Configuration du modèle CNN."""
-    # Architecture choice: 'simple' or 'resnet'
-    architecture: str = 'simple'
+    # Architecture choice: 'CNN' or 'ResNet'
+    architecture: str = 'ResNet'
     
-    # Pour SpectralCNN simple
+    # Pour CNN simple
     conv_channels: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
     kernel_sizes: List[int] = field(default_factory=lambda: [7, 5, 3, 3])
     pool_sizes: List[int] = field(default_factory=lambda: [2, 2, 2, 2])
@@ -29,8 +29,8 @@ class ModelConfig:
     
     def __post_init__(self):
         """Validation."""
-        if self.architecture not in ['simple', 'resnet']:
-            raise ValueError("architecture must be 'simple' or 'resnet'")
+        if self.architecture not in ['CNN', 'ResNet']:
+            raise ValueError("architecture must be 'CNN' or 'ResNet'")
         if self.dropout < 0 or self.dropout > 1:
             raise ValueError("dropout must be between 0 and 1")
 

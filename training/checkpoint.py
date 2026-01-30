@@ -25,11 +25,9 @@ class CheckpointManager:
         self.model_folder = Path(model_folder)
         self.model_basename = model_basename
         self.keep_last_n = keep_last_n
-        
-        # Créer le dossier si nécessaire
+
         self.model_folder.mkdir(parents=True, exist_ok=True)
         
-        # Meilleur score pour déterminer si un checkpoint est "best"
         self.best_score = float('-inf')
         
         print(f" CheckpointManager initialisé:")

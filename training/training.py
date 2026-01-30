@@ -225,7 +225,7 @@ class Trainer:
             self.feature_stats = self._compute_feature_stats()
             print(f"   • Feature stats computed: mean shape {np.array(self.feature_stats['mean']).shape}, std shape {np.array(self.feature_stats['std']).shape}")
         except Exception as e:
-            print(f"   ⚠️  Could not compute feature stats: {e}")
+            print(f"     Could not compute feature stats: {e}")
             self.feature_stats = None
 
         # Charger un checkpoint si spécifié
@@ -246,7 +246,7 @@ class Trainer:
                 pw_tensor = torch.tensor(pw, device=self.device, dtype=torch.float32)
             except Exception:
                 pw_tensor = None
-            print(f"   📊 Utilisation de BCEWithLogitsLoss avec pos_weight={pw}")
+            print(f"    Utilisation de BCEWithLogitsLoss avec pos_weight={pw}")
             if pw_tensor is not None:
                 return nn.BCEWithLogitsLoss(pos_weight=pw_tensor)
         # Par défaut
@@ -279,7 +279,7 @@ class Trainer:
 
     def _load_pretrained(self, checkpoint_path: str):
         """Charge un checkpoint pré-entraîné."""
-        print(f"\n📥 Chargement du checkpoint: {checkpoint_path}")
+        print(f"\n Chargement du checkpoint: {checkpoint_path}")
 
         # Option 1: Si checkpoint_path est juste un nom ('best', '01', etc.)
         checkpoint = self.checkpoint_manager.load_checkpoint(
@@ -302,7 +302,7 @@ class Trainer:
         self.state.global_step = checkpoint.get('global_step', 0)
         self.state.best_val_f1 = checkpoint.get('best_val_f1', 0.0)
 
-        print(f"✅ Checkpoint chargé (epoch {self.state.epoch}, best F1: {self.state.best_val_f1:.4f})")
+        print(f" Checkpoint chargé (epoch {self.state.epoch}, best F1: {self.state.best_val_f1:.4f})")
 
     def train_epoch(self) -> Dict[str, float]:
         """Effectue une epoch d'entraînement."""
@@ -391,10 +391,6 @@ class Trainer:
         # Compute avec métriques probabilistes
         epoch_metrics = metrics_accum.compute(compute_probabilistic=True)
         
-        # ========================================================================
-        # CALCUL DES NOUVELLES MÉTRIQUES COMPOSITES
-        # ========================================================================
-        
         # 1. G-Mean: √(Recall × Specificity)
         g_mean = np.sqrt(epoch_metrics.recall * epoch_metrics.specificity)
         
@@ -437,10 +433,7 @@ class Trainer:
                 0.30 * epoch_metrics.auprc +
                 0.20 * (1.0 - epoch_metrics.brier_score)  # Brier score inversé (plus bas = mieux)
             )
-        
-        # ========================================================================
-        # RETOUR DU DICTIONNAIRE COMPLET
-        # ========================================================================
+
         return {
             'loss': avg_loss,
             'accuracy': epoch_metrics.accuracy,
@@ -510,36 +503,19 @@ class Trainer:
         avg_loss = total_loss / num_batches
         epoch_metrics = metrics_accum.compute(compute_probabilistic=True)
         
-        # ========================================================================
-        # CALCUL DES NOUVELLES MÉTRIQUES COMPOSITES
-        # ========================================================================
-        
-        # 1. G-Mean: √(Recall × Specificity)
         g_mean = np.sqrt(epoch_metrics.recall * epoch_metrics.specificity)
-        
-        # 2. Min Class Recall
         min_class_recall = min(epoch_metrics.class_0_recall, epoch_metrics.class_1_recall)
-        
-        # 3. Class Balance Gap
         class_balance_gap = abs(epoch_metrics.class_0_recall - epoch_metrics.class_1_recall)
-        
-        # 4. Stability Score (moyenne de MCC et Cohen's Kappa)
         stability_score = (epoch_metrics.mcc + epoch_metrics.cohen_kappa) / 2.0
-        
-        # 5. Production Score (équilibre precision/recall/specificity)
         production_score = (
             0.3 * epoch_metrics.precision +
             0.4 * epoch_metrics.recall +
             0.3 * epoch_metrics.specificity
         )
-        
-        # 6. F-Harmonic (moyenne harmonique de F1 et F2)
         if epoch_metrics.f1 > 0 and epoch_metrics.f2 > 0:
             f_harmonic = 2 * (epoch_metrics.f1 * epoch_metrics.f2) / (epoch_metrics.f1 + epoch_metrics.f2)
         else:
             f_harmonic = 0.0
-        
-        # 7. Composite Score (combinaison pondérée de 5 métriques clés)
         composite_score = (
             0.25 * epoch_metrics.mcc +                    # Robustesse générale
             0.20 * epoch_metrics.balanced_accuracy +      # Équilibre des classes
@@ -557,9 +533,7 @@ class Trainer:
                 0.20 * (1.0 - epoch_metrics.brier_score)  # Brier score inversé (plus bas = mieux)
             )
         
-        # ========================================================================
-        # RETOUR DU DICTIONNAIRE COMPLET
-        # ========================================================================
+
         return {
             'loss': avg_loss,
             'accuracy': epoch_metrics.accuracy,
@@ -691,19 +665,10 @@ class Trainer:
                 self.state.epoch = epoch
                 epoch_start = time.time()
 
-                # ================================================================
-                # PHASE D'ENTRAÎNEMENT
-                # ================================================================
                 train_metrics = self.train_epoch()
-
-                # ================================================================
-                # PHASE DE VALIDATION
-                # ================================================================
+                
                 val_metrics = self.validate()
 
-                # ================================================================
-                # MISE À JOUR DES HISTORIQUES (métriques de base)
-                # ================================================================
                 self.state.train_losses.append(train_metrics['loss'])
                 self.state.val_losses.append(val_metrics['loss'])
                 
@@ -767,9 +732,6 @@ class Trainer:
                 self.state.train_brier_score.append(train_metrics['brier_score'] if train_metrics['brier_score'] is not None else 0.0)
                 self.state.val_brier_score.append(val_metrics['brier_score'] if val_metrics['brier_score'] is not None else 0.0)
 
-                # ================================================================
-                # HISTORIQUES DES NOUVELLES MÉTRIQUES COMPOSITES
-                # ================================================================
                 train_composite_scores.append(train_metrics['composite_score'])
                 val_composite_scores.append(val_metrics['composite_score'])
                 
@@ -782,9 +744,6 @@ class Trainer:
                 val_production_scores.append(val_metrics['production_score'])
                 val_f_harmonic.append(val_metrics['f_harmonic'])
 
-                # ================================================================
-                # TENSORBOARD - MÉTRIQUES DE BASE
-                # ================================================================
                 self.writer.add_scalars('Loss', {
                     'train': train_metrics['loss'],
                     'val': val_metrics['loss']
@@ -875,9 +834,6 @@ class Trainer:
                         'val': val_metrics['brier_score']
                     }, epoch)
 
-                # ================================================================
-                # TENSORBOARD - NOUVELLES MÉTRIQUES COMPOSITES
-                # ================================================================
                 self.writer.add_scalars('Composite_Score', {
                     'train': train_metrics['composite_score'],
                     'val': val_metrics['composite_score']
@@ -906,34 +862,34 @@ class Trainer:
                 epoch_time = time.time() - epoch_start
                 
                 print(f"\n{'='*90}")
-                print(f"📊 Epoch {epoch + 1}/{num_epochs} - Temps: {epoch_time:.2f}s")
+                print(f" Epoch {epoch + 1}/{num_epochs} - Temps: {epoch_time:.2f}s")
                 print(f"{'='*90}")
                 
-                print(f"\n🔹 MÉTRIQUES DE BASE:")
+                print(f"\n MÉTRIQUES DE BASE:")
                 print(f"  Loss:              Train: {train_metrics['loss']:.4f} | Val: {val_metrics['loss']:.4f}")
                 print(f"  Accuracy:          Train: {train_metrics['accuracy']:.4f} | Val: {val_metrics['accuracy']:.4f}")
                 print(f"  Balanced Acc:      Train: {train_metrics['balanced_accuracy']:.4f} | Val: {val_metrics['balanced_accuracy']:.4f}")
                 print(f"  MCC:               Train: {train_metrics['mcc']:.4f} | Val: {val_metrics['mcc']:.4f}")
                 print(f"  Cohen's Kappa:     Train: {train_metrics['cohen_kappa']:.4f} | Val: {val_metrics['cohen_kappa']:.4f}")
                 
-                print(f"\n🔹 F-SCORES & IoU:")
+                print(f"\n F-SCORES & IoU:")
                 print(f"  F1:                Train: {train_metrics['f1']:.4f} | Val: {val_metrics['f1']:.4f}")
                 print(f"  F2:                Train: {train_metrics['f2']:.4f} | Val: {val_metrics['f2']:.4f}")
                 print(f"  IoU:               Train: {train_metrics['iou']:.4f} | Val: {val_metrics['iou']:.4f}")
                 
-                print(f"\n🔹 PRECISION, RECALL, SPECIFICITY:")
+                print(f"\n PRECISION, RECALL, SPECIFICITY:")
                 print(f"  Precision:         Train: {train_metrics['precision']:.4f} | Val: {val_metrics['precision']:.4f}")
                 print(f"  Recall:            Train: {train_metrics['recall']:.4f} | Val: {val_metrics['recall']:.4f}")
                 print(f"  Specificity:       Train: {train_metrics['specificity']:.4f} | Val: {val_metrics['specificity']:.4f}")
                 
-                print(f"\n🎯 MÉTRIQUES COMPOSITES:")
+                print(f"\n MÉTRIQUES COMPOSITES:")
                 print(f"  Composite Score:   Train: {train_metrics['composite_score']:.4f} | Val: {val_metrics['composite_score']:.4f}")
                 print(f"  G-Mean:            Train: {train_metrics['g_mean']:.4f} | Val: {val_metrics['g_mean']:.4f}")
                 print(f"  Stability Score:   Train: {train_metrics['stability_score']:.4f} | Val: {val_metrics['stability_score']:.4f}")
                 print(f"  Production Score:  Train: {train_metrics['production_score']:.4f} | Val: {val_metrics['production_score']:.4f}")
                 print(f"  F-Harmonic:        Train: {train_metrics['f_harmonic']:.4f} | Val: {val_metrics['f_harmonic']:.4f}")
                 
-                print(f"\n⚖️  ÉQUILIBRE ENTRE CLASSES:")
+                print(f"\n  ÉQUILIBRE ENTRE CLASSES:")
                 print(f"  Min Class Recall:         {val_metrics['min_class_recall']:.4f}")
                 print(f"  Class Balance Gap:        {val_metrics['class_balance_gap']:.4f} (↓ = mieux)")
                 print(f"  Classe 0 - Precision:     {val_metrics['class_0_precision']:.4f}")
@@ -942,46 +898,28 @@ class Trainer:
                 print(f"  Classe 1 - Recall:        {val_metrics['class_1_recall']:.4f}")
                 
                 if val_metrics.get('auroc') is not None:
-                    print(f"\n📈 MÉTRIQUES PROBABILISTES:")
+                    print(f"\n MÉTRIQUES PROBABILISTES:")
                     print(f"  AUROC:             Train: {train_metrics.get('auroc', 0.0):.4f} | Val: {val_metrics['auroc']:.4f}")
                     print(f"  AUPRC:             Train: {train_metrics.get('auprc', 0.0):.4f} | Val: {val_metrics['auprc']:.4f}")
                     print(f"  Brier Score:       Train: {train_metrics.get('brier_score', 0.0):.4f} | Val: {val_metrics['brier_score']:.4f}")
                     if val_metrics.get('probabilistic_score') is not None:
                         print(f"  Probabilistic Sc:         {val_metrics['probabilistic_score']:.4f}")
                 
-                print(f"\n📊 SUPPORT:")
+                print(f"\n SUPPORT:")
                 print(f"  Classe 0:          Train: {train_metrics['support_class_0']} | Val: {val_metrics['support_class_0']}")
                 print(f"  Classe 1:          Train: {train_metrics['support_class_1']} | Val: {val_metrics['support_class_1']}")
                 
-                print(f"\n🔧 HYPERPARAMÈTRES:")
+                print(f"\n HYPERPARAMÈTRES:")
                 print(f"  Learning Rate:     {self._get_lr():.2e}")
                 print(f"  Patience Counter:  {self.state.patience_counter}/{patience}")
 
-                # ================================================================
-                # CALCUL DES AMÉLIORATIONS
-                # ================================================================
-                # Stratégie 1: Composite Score (RECOMMANDÉ pour un équilibre global)
                 composite_improvement = val_metrics['composite_score'] - best_metrics['composite_score']
-                
-                # Stratégie 2: G-Mean (bon pour équilibre classe minoritaire/majoritaire)
                 gmean_improvement = val_metrics['g_mean'] - best_metrics['g_mean']
-                
-                # Stratégie 3: Stability Score (MCC + Kappa)
                 stability_improvement = val_metrics['stability_score'] - best_metrics['stability_score']
-                
-                # Stratégie 4: Production Score (orienté déploiement)
                 production_improvement = val_metrics['production_score'] - best_metrics['production_score']
-                
-                # Stratégie 5: MCC pur (métrique classique)
                 mcc_improvement = val_metrics['mcc'] - best_metrics['mcc']
-                
-                # Stratégie 6: F-Harmonic
                 f_harmonic_improvement = val_metrics['f_harmonic'] - best_metrics['f_harmonic']
 
-                # ================================================================
-                # CHOIX DE LA STRATÉGIE D'AMÉLIORATION
-                # ================================================================
-                # 🎯 OPTION A: Composite Score (RECOMMANDÉ - équilibre général)
                 primary_improvement = composite_improvement
                 primary_metric_name = 'Composite Score'
                 primary_metric_value = val_metrics['composite_score']
@@ -1011,12 +949,10 @@ class Trainer:
                 # primary_metric_value = val_metrics['production_score']
                 # primary_best_value = best_metrics['production_score']
 
-                # ================================================================
-                # DÉCISION D'AMÉLIORATION ET SAUVEGARDE
-                # ================================================================
+
                 if primary_improvement > min_delta:
                     print(f"\n{'='*90}")
-                    print(f"✅ AMÉLIORATION DÉTECTÉE!")
+                    print(f" AMÉLIORATION DÉTECTÉE!")
                     print(f"{'='*90}")
                     print(f"  Métrique principale:      {primary_metric_name}")
                     print(f"  Amélioration:             +{primary_improvement:.4f}")
@@ -1039,7 +975,7 @@ class Trainer:
                     self.state.patience_counter = 0
 
                     # Afficher toutes les améliorations
-                    print(f"\n  📊 Détail des améliorations:")
+                    print(f"\n   Détail des améliorations:")
                     print(f"     Composite Score:      +{composite_improvement:.4f}")
                     print(f"     MCC:                  +{mcc_improvement:.4f}")
                     print(f"     G-Mean:               +{gmean_improvement:.4f}")
@@ -1094,14 +1030,14 @@ class Trainer:
                 else:
                     self.state.patience_counter += 1
                     print(f"\n{'='*90}")
-                    print(f"⏳ PATIENCE: {self.state.patience_counter}/{patience}")
+                    print(f" PATIENCE: {self.state.patience_counter}/{patience}")
                     print(f"{'='*90}")
                     print(f"  Métrique principale:      {primary_metric_name}")
                     print(f"  Valeur actuelle:          {primary_metric_value:.4f}")
                     print(f"  Meilleure valeur:         {primary_best_value:.4f}")
                     print(f"  Amélioration:             {primary_improvement:+.4f}")
                     print(f"  Amélioration requise:     >{min_delta:.4f}")
-                    print(f"\n  📊 État des autres métriques:")
+                    print(f"\n   État des autres métriques:")
                     print(f"     Composite Score:      {val_metrics['composite_score']:.4f} (best: {best_metrics['composite_score']:.4f})")
                     print(f"     MCC:                  {val_metrics['mcc']:.4f} (best: {best_metrics['mcc']:.4f})")
                     print(f"     G-Mean:               {val_metrics['g_mean']:.4f} (best: {best_metrics['g_mean']:.4f})")
@@ -1109,9 +1045,7 @@ class Trainer:
                     print(f"     Production Score:     {val_metrics['production_score']:.4f} (best: {best_metrics['production_score']:.4f})")
                     print(f"{'='*90}\n")
 
-                # ================================================================
-                # SAUVEGARDE CHECKPOINT INITIAL (epoch 0)
-                # ================================================================
+
                 if epoch == 0 and primary_improvement <= min_delta:
                     try:
                         self.checkpoint_manager.save_checkpoint(
@@ -1139,13 +1073,10 @@ class Trainer:
                             config=self.config.to_dict(),
                             is_best=False
                         )
-                        print(f"💾 Checkpoint initial epoch {epoch + 1} sauvegardé\n")
+                        print(f" Checkpoint initial epoch {epoch + 1} sauvegardé\n")
                     except Exception as e:
-                        print(f"⚠️  Erreur sauvegarde checkpoint initial: {e}\n")
+                        print(f"  Erreur sauvegarde checkpoint initial: {e}\n")
 
-                # ================================================================
-                # SAUVEGARDE PÉRIODIQUE
-                # ================================================================
                 if (epoch + 1) % save_every == 0:
                     try:
                         self.checkpoint_manager.save_checkpoint(
@@ -1182,12 +1113,12 @@ class Trainer:
                 # ================================================================
                 if self.state.patience_counter >= patience:
                     print(f"\n{'='*90}")
-                    print(f"⚠️  EARLY STOPPING DÉCLENCHÉ")
+                    print(f"  EARLY STOPPING DÉCLENCHÉ")
                     print(f"{'='*90}")
                     print(f"  Patience épuisée:         {patience} epochs")
                     print(f"  Meilleur epoch:           {epoch + 1 - patience}")
                     print(f"  Meilleur {primary_metric_name}: {primary_best_value:.4f}")
-                    print(f"\n  📊 Meilleures valeurs:")
+                    print(f"\n   Meilleures valeurs:")
                     print(f"     Composite Score:      {best_metrics['composite_score']:.4f}")
                     print(f"     MCC:                  {best_metrics['mcc']:.4f}")
                     print(f"     G-Mean:               {best_metrics['g_mean']:.4f}")
@@ -1205,7 +1136,7 @@ class Trainer:
             elapsed_time = time.time() - start_time
             
             print(f"\n{'='*90}")
-            print(f"✅ ENTRAÎNEMENT TERMINÉ")
+            print(f" ENTRAÎNEMENT TERMINÉ")
             print(f"{'='*90}")
             print(f"  Durée totale:             {self._format_time(elapsed_time)}")
             print(f"  Epochs effectués:         {epoch + 1}/{num_epochs}")
@@ -1216,17 +1147,17 @@ class Trainer:
             best_epoch_idx = np.argmax(val_composite_scores)
             
             print(f"\n{'='*90}")
-            print(f"🏆 MEILLEURS RÉSULTATS (Epoch {best_epoch_idx + 1})")
+            print(f" MEILLEURS RÉSULTATS (Epoch {best_epoch_idx + 1})")
             print(f"{'='*90}")
             
-            print(f"\n  🎯 Métriques composites:")
+            print(f"\n   Métriques composites:")
             print(f"     Composite Score:      {best_metrics['composite_score']:.4f}")
             print(f"     G-Mean:               {best_metrics['g_mean']:.4f}")
             print(f"     Stability Score:      {best_metrics['stability_score']:.4f}")
             print(f"     Production Score:     {best_metrics['production_score']:.4f}")
             print(f"     F-Harmonic:           {best_metrics['f_harmonic']:.4f}")
             
-            print(f"\n  📊 Métriques de base:")
+            print(f"\n   Métriques de base:")
             print(f"     MCC:                  {best_metrics['mcc']:.4f}")
             print(f"     F1:                   {self.state.val_f1[best_epoch_idx]:.4f}")
             print(f"     F2:                   {self.state.val_f2[best_epoch_idx]:.4f}")
@@ -1234,7 +1165,7 @@ class Trainer:
             print(f"     Cohen's Kappa:        {self.state.val_cohen_kappa[best_epoch_idx]:.4f}")
             print(f"     IoU:                  {self.state.val_iou[best_epoch_idx]:.4f}")
             
-            print(f"\n  ⚖️  Équilibre des classes:")
+            print(f"\n    Équilibre des classes:")
             print(f"     Min Class Recall:     {val_min_class_recalls[best_epoch_idx]:.4f}")
             print(f"     Class Balance Gap:    {val_class_balance_gaps[best_epoch_idx]:.4f}")
             print(f"     Classe 0 Precision:   {self.state.val_class_0_precision[best_epoch_idx]:.4f}")
@@ -1243,12 +1174,12 @@ class Trainer:
             print(f"     Classe 1 Recall:      {self.state.val_class_1_recall[best_epoch_idx]:.4f}")
             
             if best_metrics['auroc'] > 0:
-                print(f"\n  📈 Métriques probabilistes:")
+                print(f"\n   Métriques probabilistes:")
                 print(f"     AUROC:                {best_metrics['auroc']:.4f}")
                 print(f"     AUPRC:                {self.state.val_auprc[best_epoch_idx]:.4f}")
                 print(f"     Brier Score:          {self.state.val_brier_score[best_epoch_idx]:.4f}")
             
-            print(f"\n  📊 Support:")
+            print(f"\n   Support:")
             print(f"     Classe 0:             {self.state.val_support_class_0[best_epoch_idx]}")
             print(f"     Classe 1:             {self.state.val_support_class_1[best_epoch_idx]}")
             
@@ -1278,14 +1209,14 @@ class Trainer:
             }
 
         except KeyboardInterrupt:
-            print("\n\n⚠️  Entraînement interrompu par l'utilisateur")
+            print("\n\n  Entraînement interrompu par l'utilisateur")
             print(f"   Epoch actuel: {epoch + 1}/{num_epochs}")
             print(f"   Steps effectués: {self.state.global_step}")
             self.writer.close()
             raise
             
         except Exception as e:
-            print(f"\n\n❌ ERREUR PENDANT L'ENTRAÎNEMENT")
+            print(f"\n\n ERREUR PENDANT L'ENTRAÎNEMENT")
             print(f"   Epoch: {epoch + 1}/{num_epochs}")
             print(f"   Erreur: {str(e)}")
             import traceback

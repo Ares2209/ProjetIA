@@ -15,8 +15,12 @@ from tqdm import tqdm
 
 from training.config import Config, get_config_object
 from training.training import Trainer
+from training.utils import set_seed
+
 from models.dataset import ExoplanetDataset, collate_fn
-from models.CNN import CNN
+from models.CNN import CNN 
+from models.ResNetCNN import ResNet1D
+
 
 class NumpyEncoder(json.JSONEncoder):
     """Encodeur JSON personnalisé pour gérer les types NumPy."""
@@ -411,7 +415,7 @@ def create_individual_plots(history: dict, epochs, save_dir: str):
         plt.savefig(f'{save_dir}/precision_recall_ratio.png', dpi=100, bbox_inches='tight')
         plt.close()
 
-    print(f"📊 Graphiques individuels sauvegardés dans '{save_dir}/'")
+    print(f" Graphiques individuels sauvegardés dans '{save_dir}/'")
 
 def save_training_results(history: dict, save_dir: str = 'results'):
     """Sauvegarde tous les résultats d'entraînement."""
@@ -562,11 +566,11 @@ def print_training_summary(result: dict):
     early_stopped = result.get('early_stopped', False)
     
     # Informations générales
-    print(f"\n📊 Informations générales:")
+    print(f"\n Informations générales:")
     print(f"   Epochs effectuées:        {final_epoch}")
     print(f"   Meilleure epoch:          {best_epoch}")
     print(f"   Temps d'entraînement:     {training_time/3600:.2f}h ({training_time/60:.1f}min)")
-    print(f"   Early stopping:           {'✅ Oui' if early_stopped else '❌ Non'}")
+    print(f"   Early stopping:           {' Oui' if early_stopped else '❌ Non'}")
     
     if 'iteration_losses' in history:
         total_iterations = len(history['iteration_losses'])
@@ -575,13 +579,13 @@ def print_training_summary(result: dict):
             print(f"   Itérations par epoch:     {total_iterations // final_epoch:,}")
     
     # Meilleurs résultats (selon la métrique composite ou MCC)
-    print(f"\n🏆 MEILLEURS RÉSULTATS (Epoch {best_epoch}):")
+    print(f"\n MEILLEURS RÉSULTATS (Epoch {best_epoch}):")
     print(f"{'='*90}")
     
     # Métriques principales
-    print(f"\n  📈 Métriques Principales:")
+    print(f"\n   Métriques Principales:")
     if 'composite_score' in best_metrics:
-        print(f"     Composite Score:      {best_metrics['composite_score']:.4f} ⭐")
+        print(f"     Composite Score:      {best_metrics['composite_score']:.4f} ")
     if 'mcc' in best_metrics:
         print(f"     MCC:                  {best_metrics['mcc']:.4f}")
     if 'g_mean' in best_metrics:
@@ -719,6 +723,7 @@ def print_training_summary(result: dict):
 
 
 def main():
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default=None)
     args = parser.parse_args()
@@ -728,6 +733,8 @@ def main():
     else:
         cfg = get_config_object()
 
+    set_seed(cfg.data.random_seed)
+    
     cfg.print_summary()
 
     train_loader, val_loader, dataset = build_dataloaders(cfg)
@@ -735,27 +742,42 @@ def main():
     # Construire le modèle
     spectrum_length = dataset.spectra.shape[1]
     auxiliary_dim = dataset.aux_features.shape[1]
-
-    model = CNN(
+    
+    if cfg.model.architecture == "CNN":   
+        print(" Utilisation de CNN comme architecture de modèle.")
+        model = CNN(
+            spectrum_length=spectrum_length,
+            auxiliary_dim=auxiliary_dim,
+            num_classes=cfg.training.num_classes,
+            conv_channels=cfg.model.conv_channels,
+            kernel_sizes=cfg.model.kernel_sizes,
+            pool_sizes=cfg.model.pool_sizes,
+            fc_dims=cfg.model.fc_dims,
+            dropout=cfg.model.dropout,
+            use_batch_norm=cfg.model.use_batch_norm,
+            input_channels=3
+        )
+    else :
+        print(" Utilisation de ResNet1D comme architecture de modèle.")
+        model = ResNet1D(
         spectrum_length=spectrum_length,
         auxiliary_dim=auxiliary_dim,
         num_classes=cfg.training.num_classes,
-        conv_channels=cfg.model.conv_channels,
-        kernel_sizes=cfg.model.kernel_sizes,
-        pool_sizes=cfg.model.pool_sizes,
-        fc_dims=cfg.model.fc_dims,
-        dropout=cfg.model.dropout,
-        use_batch_norm=cfg.model.use_batch_norm,
-        input_channels=3
+        input_channels=3,
+        block_type='basic',
+        num_blocks=[2, 2, 2, 2],
+        base_channels=64,
+        dropout=cfg.model.dropout
     )
+    
 
     trainer = Trainer(model, train_loader, val_loader, cfg)
 
     print("\n🚀 Début de l'entraînement...\n")
-    result = trainer.train()  # ⚠️ Changement: 'result' au lieu de 'history'
+    result = trainer.train()
 
     # Affichage et sauvegarde des résultats
-    print_training_summary(result)  # ⚠️ On passe 'result'
+    print_training_summary(result)
 
     # Extraction de l'historique pour la sauvegarde
     history = result.get('history', {})
@@ -772,7 +794,7 @@ def main():
     save_training_results(history, cfg.results_folder)
     plot_training_results(history, cfg.results_folder)
     
-    print(f"\n✅ Résultats sauvegardés dans: {cfg.results_folder}")
+    print(f"\n Résultats sauvegardés dans: {cfg.results_folder}")
     print(f"   - training_history.json")
     print(f"   - training_results.csv")
     print(f"   - Graphiques PNG\n")
