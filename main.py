@@ -18,6 +18,7 @@ from training.training import Trainer
 from training.utils import set_seed
 
 from models.dataset import ExoplanetDataset, collate_fn
+from sklearn.model_selection import train_test_split
 from models.CNN import CNN 
 from models.ResNetCNN import ResNet1D
 
@@ -33,67 +34,112 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return super().default(obj)
 
-def build_dataloaders(config: Config):
-    """Construit les dataloaders pour l'entraînement et la validation."""
+def build_dataloaders(config):
+    """
+    Construit les dataloaders sans data leakage :
+      1. Chargement brut des données
+      2. Split indices AVANT toute normalisation / augmentation
+      3. Stats de normalisation calculées sur le train uniquement
+      4. Augmentation activée uniquement sur le train
+    """
     data_cfg = config.data
-    spectra_path = Path(data_cfg.spectra_train_path)    
-    aux_path = Path(data_cfg.auxiliary_train_path)  
-    targets_path = Path(data_cfg.targets_train_path)
 
-    # If default paths don't exist, try the provided dataset folder
+    spectra_path  = Path(data_cfg.spectra_train_path)
+    aux_path      = Path(data_cfg.auxiliary_train_path)
+    targets_path  = Path(data_cfg.targets_train_path)
+
+    fallback_root = Path('Défi-IA-2026') / 'DATA' / 'defi-ia-cnes'
     if not spectra_path.exists():
-        alt = Path('Défi-IA-2026') / 'DATA' / 'defi-ia-cnes' / 'spectra.npy'
-        if alt.exists():
-            spectra_path = alt
+        spectra_path = fallback_root / 'spectra.npy'
     if not aux_path.exists():
-        alt = Path('Défi-IA-2026') / 'DATA' / 'defi-ia-cnes' / 'auxiliary.csv'
-        if alt.exists():
-            aux_path = alt
+        aux_path     = fallback_root / 'auxiliary.csv'
     if not targets_path.exists():
-        alt = Path('Défi-IA-2026') / 'DATA' / 'defi-ia-cnes' / 'targets.csv'
-        if alt.exists():
-            targets_path = alt
+        targets_path = fallback_root / 'targets.csv'
 
-    print(f"Using spectra: {spectra_path}")
-    print(f"Using auxiliary: {aux_path}")
-    print(f"Using targets: {targets_path}")
+    print(f"Using spectra:    {spectra_path}")
+    print(f"Using auxiliary:  {aux_path}")
+    print(f"Using targets:    {targets_path}")
 
-    dataset = ExoplanetDataset(
-        str(spectra_path), 
-        str(aux_path), 
-        str(targets_path), 
-        is_train=True,
-        augmentation_factor=10, 
-        shift_range=0.05,
-        scale_range=0.1
+    # ------------------------------------------------------------------ #
+    #  Chargement brut                                                     #
+    # ------------------------------------------------------------------ #
+    spectra_all  = np.load(spectra_path)                    # (N, 52, 3)
+    aux_df_all   = pd.read_csv(aux_path)
+    targets_df_all = pd.read_csv(targets_path)
+
+    n_samples = len(spectra_all)
+
+    # ------------------------------------------------------------------ #
+    #  Split indices (sur échantillons ORIGINAUX, avant augmentation)      #
+    # ------------------------------------------------------------------ #
+    indices = list(range(n_samples))
+    train_idx, val_idx = train_test_split(
+        indices,
+        test_size=1 - data_cfg.train_ratio,
+        random_state=42,
+        shuffle=True
     )
 
-    # Split train/val
-    total = len(dataset)
-    train_len = int(total * data_cfg.train_ratio)
-    val_len = total - train_len
+    # ------------------------------------------------------------------ #
+    #  Sous-ensembles bruts                                                #
+    # ------------------------------------------------------------------ #
+    spectra_train  = spectra_all[train_idx]
+    spectra_val    = spectra_all[val_idx]
 
-    train_ds, val_ds = random_split(dataset, [train_len, val_len])
+    aux_train  = aux_df_all.iloc[train_idx].reset_index(drop=True)
+    aux_val    = aux_df_all.iloc[val_idx].reset_index(drop=True)
 
+    targets_train = targets_df_all.iloc[train_idx].reset_index(drop=True)
+    targets_val   = targets_df_all.iloc[val_idx].reset_index(drop=True)
+
+    # ------------------------------------------------------------------ #
+    #  Construction des datasets                                           #
+    #  → Les stats de normalisation sont apprises sur train               #
+    #    et réutilisées pour val (via aux_mean / aux_std)                 #
+    # ------------------------------------------------------------------ #
+    train_dataset = ExoplanetDataset(
+        spectra=spectra_train,
+        auxiliary_df=aux_train,
+        targets_df=targets_train,
+        is_train=True,
+        augmentation_factor=config.data.augmentation_factor,
+        shift_range=0.05,
+        scale_range=0.1,
+        # mean/std = None → calculés automatiquement sur le train
+    )
+
+    val_dataset = ExoplanetDataset(
+        spectra=spectra_val,
+        auxiliary_df=aux_val,
+        targets_df=targets_val,
+        is_train=False,
+        augmentation_factor=0,          # ← jamais d'augmentation en val
+        aux_mean=train_dataset.aux_mean, # ← stats du train réutilisées
+        aux_std=train_dataset.aux_std,
+    )
+
+    # ------------------------------------------------------------------ #
+    #  DataLoaders                                                         #
+    # ------------------------------------------------------------------ #
     train_loader = DataLoader(
-        train_ds,
+        train_dataset,
         batch_size=config.training.batch_size,
         shuffle=True,
         num_workers=data_cfg.num_workers,
         pin_memory=data_cfg.pin_memory,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
     )
 
     val_loader = DataLoader(
-        val_ds,
+        val_dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
         num_workers=data_cfg.num_workers,
         pin_memory=data_cfg.pin_memory,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
     )
 
-    return train_loader, val_loader, dataset
+    return train_loader, val_loader, train_dataset
 
 def plot_training_results(history: dict, save_dir: str = 'results'):
     """Crée tous les graphiques d'entraînement avec métriques enrichies."""

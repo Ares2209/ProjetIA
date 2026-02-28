@@ -69,6 +69,7 @@ class TrainingConfig:
     
     # Loss
     pos_weight: Optional[List[float]] = None  # [weight_eau, weight_nuages]
+    loss_type = ""
     
     classification_threshold: float = 0.5
     
@@ -110,7 +111,8 @@ class DataConfig:
     normalize_auxiliary: str = 'zscore'
     
     # Augmentation (optionnel)
-    use_augmentation: bool = False
+    use_augmentation: bool = True # non pris en compte pour le moment
+    augmentation_factor: int = 10 
     noise_std: float = 0.01
     
     # Seed

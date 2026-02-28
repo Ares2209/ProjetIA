@@ -19,7 +19,7 @@ from accelerate import Accelerator
 
 from sklearn.inspection import permutation_importance
 from .metrique import MetricsCalculator, MetricsAccumulator
-from .Loss import BinaryClassificationLoss
+from .Loss import BCE
 from .checkpoint import CheckpointManager
 from .config import TrainingConfig, Config
 
@@ -234,23 +234,23 @@ class Trainer:
 
         print(f"\nTrainer initialisé:")
         print(f"   • Device: {self.device}")
-        print(f"   • Loss: {config.training.loss_type}")
 
     def _setup_criterion(self) -> nn.Module:
         """Configure la fonction de perte."""
-        # Utiliser BCEWithLogitsLoss compatible avec la sortie du CNN
-        # Si des poids de classes sont fournis dans la config, les appliquer
-        if getattr(self.config.training, 'pos_weight', None) is not None:
-            pw = self.config.training.pos_weight
+        pos_weight = getattr(self.config.training, 'pos_weight', None)
+        pw_tensor = None
+
+        if pos_weight is not None:
             try:
-                pw_tensor = torch.tensor(pw, device=self.device, dtype=torch.float32)
+                pw_tensor = torch.tensor(pos_weight, device=self.device, dtype=torch.float32)
             except Exception:
-                pw_tensor = None
-            print(f"    Utilisation de BCEWithLogitsLoss avec pos_weight={pw}")
-            if pw_tensor is not None:
-                return nn.BCEWithLogitsLoss(pos_weight=pw_tensor)
-        # Par défaut
-        return nn.BCEWithLogitsLoss()
+                pass
+
+        return BCE(
+            pos_weight=pw_tensor,
+            reduction=getattr(self.config.training, 'reduction', 'mean'),
+            label_smoothing=getattr(self.config.training, 'label_smoothing', 0.0),
+        )
 
     def _setup_optimizer(self) -> torch.optim.Optimizer:
         """Configure l'optimiseur."""
