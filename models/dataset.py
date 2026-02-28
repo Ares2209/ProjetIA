@@ -152,7 +152,6 @@ class ExoplanetDataset(Dataset):
     def _normalize_spectra(self, spectra):
         """
         Normalisation Min-Max par échantillon et par canal.
-        ✅ Pas de leakage : chaque spectre est normalisé indépendamment.
         Input shape : (N, 52, 3)
         """
         spectra = spectra.astype(np.float32)
