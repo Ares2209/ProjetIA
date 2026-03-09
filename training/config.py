@@ -19,8 +19,8 @@ class ModelConfig:
     fc_dims: List[int] = field(default_factory=lambda: [256, 128])
     
     # Pour ResNetSpectralCNN
-    d_model: int = 128  # initial_channels pour ResNet
-    num_layers: int = 2  # num_blocks par layer
+    d_model: int = 32  # initial_channels pour ResNet
+    num_layers: int = 1  # num_blocks par layer
     
     # Commun
     dropout: float = 0.3
@@ -39,8 +39,8 @@ class TrainingConfig:
     """Configuration de l'entraînement."""
     num_classes: int = 2  # eau, nuages
     batch_size: int = 64
-    num_epochs: int = 500
-    learning_rate: float = 1e-3
+    num_epochs: int = 100
+    learning_rate: float = 1e-4
     patience: int = 50
     preload: Optional[str] = None
     
@@ -88,40 +88,57 @@ class TrainingConfig:
             raise ValueError("learning_rate must be > 0")
 
 @dataclass
+@dataclass
 class DataConfig:
     """Configuration des données exoplanètes."""
     # Chemins des fichiers
     spectra_train_path: str = 'spectra.npy'
     auxiliary_train_path: str = 'auxiliary.csv'
     targets_train_path: str = 'targets_train.csv'
-    
+
     spectra_test_path: str = 'spectra_test.npy'
     auxiliary_test_path: str = 'auxiliary_test.csv'
-    
+
     # Split validation
     train_ratio: float = 0.8
     val_ratio: float = 0.2
-    
+
     # DataLoader
     num_workers: int = 4
     pin_memory: bool = True
-    
+
     # Normalisation
-    normalize_spectra: str = 'minmax'  # 'minmax', 'zscore', or 'none'
-    normalize_auxiliary: str = 'zscore'
-    
-    # Augmentation (optionnel)
-    use_augmentation: bool = True # non pris en compte pour le moment
-    augmentation_factor: int = 10 
-    noise_std: float = 0.01
-    
+    normalize_spectra: str = 'minmax'    # 'minmax', 'zscore', 'none'
+    normalize_auxiliary: str = 'zscore'  # 'zscore', 'minmax', 'none'
+
+    # Augmentation
+    use_augmentation: bool = True
+    augmentation_factor: int = 3         # copies augmentées par échantillon
+    shift_range: float = 0.05             # décalage additif max (fraction de la std)
+    scale_range: float = 0.10             # mise à l'échelle multiplicative max
+    noise_std: float = 0.02               # écart-type du bruit gaussien
+    flip_prob: float = 0.5                # proba de retourner le spectre
+    channel_dropout_prob: float = 0.1     # proba de zeroing d'un canal
+
     # Seed
     random_seed: int = 42
-    
+
     def __post_init__(self):
         """Validation."""
         if self.train_ratio + self.val_ratio > 1.0:
             raise ValueError("train_ratio + val_ratio cannot exceed 1.0")
+        if not 0.0 <= self.flip_prob <= 1.0:
+            raise ValueError("flip_prob must be between 0 and 1")
+        if not 0.0 <= self.channel_dropout_prob <= 1.0:
+            raise ValueError("channel_dropout_prob must be between 0 and 1")
+        if self.augmentation_factor < 0:
+            raise ValueError("augmentation_factor must be >= 0")
+        if self.noise_std < 0:
+            raise ValueError("noise_std must be >= 0")
+        if self.shift_range < 0:
+            raise ValueError("shift_range must be >= 0")
+        if self.scale_range < 0:
+            raise ValueError("scale_range must be >= 0")
 
 @dataclass
 class PathsConfig:

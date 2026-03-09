@@ -286,10 +286,6 @@ class Trainer:
             checkpoint_name=checkpoint_path,
             device=str(self.device)  # Convertir en string
         )
-
-        # Option 2: Si checkpoint_path est un chemin complet
-        # checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
         self.model.load_state_dict(checkpoint['model_state_dict'])
 
         if 'optimizer_state_dict' in checkpoint:
@@ -571,43 +567,57 @@ class Trainer:
         }
 
     def _compute_feature_stats(self):
-        """Calcule la moyenne et l'écart-type des features sur l'ensemble d'entraînement.
-        
-        Retourne un dictionnaire {'mean': [...], 'std': [...]} utilisable directement par le script
-        de prédiction pour normaliser les features à l'inférence.
-        """
+        """Calcule la moyenne et l'écart-type des features (auxiliary + spectra flatten)
+        sur l'ensemble d'entraînement.
 
-        sum_ = None
-        sumsq_ = None
+        Retourne un dictionnaire {'mean': [...], 'std': [...]} utilisable directement
+        par le script de prédiction pour normaliser les features à l'inférence.
+        """
+        sum_    = None
+        sumsq_  = None
         total_count = 0
-        
+
         with torch.no_grad():
-            for features, labels, masks in tqdm(self.train_loader, desc="Computing feature stats", leave=False):
-                f = features.detach().cpu().numpy()
-                m = masks.detach().cpu().numpy()
-                
-                batch_size = f.shape[0]
-                for i in range(batch_size):
-                    valid = m[i]
-                    if not valid.any():
-                        continue
-                    vals = f[i, valid, :].astype(np.float64)
-                    if sum_ is None:
-                        sum_ = vals.sum(axis=0)
-                        sumsq_ = (vals ** 2).sum(axis=0)
-                    else:
-                        sum_ += vals.sum(axis=0)
-                        sumsq_ += (vals ** 2).sum(axis=0)
-                    total_count += vals.shape[0]
-        
+            for batch in tqdm(self.train_loader, desc="Computing feature stats", leave=False):
+
+                # ── Unpack selon le format de collate_fn ──────────────────────
+                # train  → (spectra, auxiliary, targets, ids)
+                # test   → (spectra, auxiliary, ids)
+                if len(batch) == 4:
+                    spectra, auxiliary, targets, ids = batch
+                else:
+                    spectra, auxiliary, ids = batch
+
+                # spectra   : (B, 3, 52)  → on aplatit les canaux
+                # auxiliary : (B, n_aux)
+                spectra_flat = spectra.reshape(spectra.shape[0], -1)   # (B, 3*52)
+                features     = torch.cat([spectra_flat, auxiliary], dim=1)  # (B, D)
+
+                f = features.detach().cpu().numpy().astype(np.float64)  # (B, D)
+
+                batch_sum   = f.sum(axis=0)        # (D,)
+                batch_sumsq = (f ** 2).sum(axis=0) # (D,)
+
+                if sum_ is None:
+                    sum_   = batch_sum
+                    sumsq_ = batch_sumsq
+                else:
+                    sum_   += batch_sum
+                    sumsq_ += batch_sumsq
+
+                total_count += f.shape[0]
+
         if total_count == 0:
-            raise RuntimeError('No valid points found in train_loader to compute feature stats')
-        
-        mean = sum_ / total_count
-        var = (sumsq_ / total_count) - (mean ** 2)
-        std = np.sqrt(np.maximum(var, 1e-8))
-        
+            raise RuntimeError(
+                "No valid samples found in train_loader to compute feature stats"
+            )
+
+        mean = sum_  / total_count
+        var  = (sumsq_ / total_count) - (mean ** 2)
+        std  = np.sqrt(np.maximum(var, 1e-8))
+
         return {'mean': mean.tolist(), 'std': std.tolist()}
+
 
     def train(self) -> Dict:
         """
@@ -897,6 +907,8 @@ class Trainer:
                 print(f"  Classe 1 - Precision:     {val_metrics['class_1_precision']:.4f}")
                 print(f"  Classe 1 - Recall:        {val_metrics['class_1_recall']:.4f}")
                 
+                # Après ton split, affiche ça :
+                
                 if val_metrics.get('auroc') is not None:
                     print(f"\n MÉTRIQUES PROBABILISTES:")
                     print(f"  AUROC:             Train: {train_metrics.get('auroc', 0.0):.4f} | Val: {val_metrics['auroc']:.4f}")
@@ -920,35 +932,10 @@ class Trainer:
                 mcc_improvement = val_metrics['mcc'] - best_metrics['mcc']
                 f_harmonic_improvement = val_metrics['f_harmonic'] - best_metrics['f_harmonic']
 
-                primary_improvement = composite_improvement
-                primary_metric_name = 'Composite Score'
-                primary_metric_value = val_metrics['composite_score']
-                primary_best_value = best_metrics['composite_score']
-                
-                # 🎯 OPTION B: MCC pur (votre approche actuelle)
-                # primary_improvement = mcc_improvement
-                # primary_metric_name = 'MCC'
-                # primary_metric_value = val_metrics['mcc']
-                # primary_best_value = best_metrics['mcc']
-                
-                # 🎯 OPTION C: G-Mean (excellent pour classes déséquilibrées)
-                # primary_improvement = gmean_improvement
-                # primary_metric_name = 'G-Mean'
-                # primary_metric_value = val_metrics['g_mean']
-                # primary_best_value = best_metrics['g_mean']
-                
-                # 🎯 OPTION D: Stability Score (robuste au bruit)
-                # primary_improvement = stability_improvement
-                # primary_metric_name = 'Stability Score'
-                # primary_metric_value = val_metrics['stability_score']
-                # primary_best_value = best_metrics['stability_score']
-                
-                # 🎯 OPTION E: Production Score (orienté déploiement)
-                # primary_improvement = production_improvement
-                # primary_metric_name = 'Production Score'
-                # primary_metric_value = val_metrics['production_score']
-                # primary_best_value = best_metrics['production_score']
-
+                primary_improvement = mcc_improvement
+                primary_metric_name = 'MCC'
+                primary_metric_value = val_metrics['mcc']
+                primary_best_value = best_metrics['mcc']
 
                 if primary_improvement > min_delta:
                     print(f"\n{'='*90}")
@@ -983,8 +970,6 @@ class Trainer:
                     print(f"     Production Score:     +{production_improvement:.4f}")
                     print(f"     F-Harmonic:           +{f_harmonic_improvement:.4f}")
                     
-                    # Conditions supplémentaires (optionnel - décommenter si besoin)
-                    # Exemple: Exiger un minimum de recall sur la classe minoritaire
                     min_recall_threshold = 0.50  # Ajustez selon vos besoins
                     min_class_recall_ok = val_metrics['min_class_recall'] >= min_recall_threshold
                     
@@ -993,7 +978,6 @@ class Trainer:
                     else:
                         print(f"     ⚠ Min Class Recall:   {val_metrics['min_class_recall']:.4f} < {min_recall_threshold} (seuil non atteint)")
 
-                    # Sauvegarder le meilleur modèle
                     try:
                         self.checkpoint_manager.save_checkpoint(
                             model=self.model,

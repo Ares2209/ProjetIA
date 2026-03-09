@@ -272,16 +272,19 @@ class ResNet1D(nn.Module):
 
         # Couches fully connected après fusion
         self.fc = nn.Sequential(
-            nn.Linear(fusion_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout)
+        nn.Linear(fusion_dim, 512),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(512, 256),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
         )
 
         # Couche de sortie
-        self.output_layer = nn.Linear(256, num_classes)
+        self.output_layer = nn.Sequential(
+        nn.LayerNorm(256),
+        nn.Linear(256, num_classes),
+        )
 
         # Initialisation des poids
         self._initialize_weights()
@@ -338,7 +341,7 @@ class ResNet1D(nn.Module):
         return nn.Sequential(*layers)
 
     def _initialize_weights(self):
-        """Initialisation He pour ReLU."""
+        """Initialisation He pour ReLU, sortie avec std=0.01."""
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -350,6 +353,10 @@ class ResNet1D(nn.Module):
             elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 nn.init.constant_(m.bias, 0)
+
+        output_linear = self.output_layer[-1]  # le nn.Linear(256, num_classes)
+        nn.init.normal_(output_linear.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(output_linear.bias)
 
     def forward(self, spectrum: torch.Tensor, auxiliary: torch.Tensor) -> torch.Tensor:
         """
