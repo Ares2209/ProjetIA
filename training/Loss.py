@@ -9,12 +9,17 @@ from typing import Optional
 class BCE(nn.Module):
     """
     Binary Cross Entropy Loss pour classification multi-label (Eau / Nuages).
-    
+
+    Supporte :
+      - inputs 2D (batch, num_classes)          ← CNN, MLP
+      - inputs 3D (batch, seq_len, num_classes) ← Transformer, RNN, avec masque optionnel
+
     Args:
-        pos_weight: Poids pour chaque classe positive (shape: [2])
-        reduction: 'mean' | 'sum' | 'none'
+        pos_weight:      Poids pour chaque classe positive (shape: [num_classes]).
+                         Enregistré comme buffer → suit automatiquement .to() / .cuda().
+        reduction:       'mean' | 'sum' | 'none'
         label_smoothing: Valeur dans [0, 1) — 0 = désactivé
-        class_names: Noms des classes pour affichage
+        class_names:     Noms des classes (pour compute_class_losses)
     """
 
     def __init__(
@@ -22,87 +27,135 @@ class BCE(nn.Module):
         pos_weight: Optional[torch.Tensor] = None,
         reduction: str = 'mean',
         label_smoothing: float = 0.0,
-        class_names: list = None
+        class_names: Optional[list] = None,
     ):
         super().__init__()
 
-        if not 0 <= label_smoothing < 1:
-            raise ValueError("label_smoothing doit être dans [0, 1)")
+        if not 0.0 <= label_smoothing < 1.0:
+            raise ValueError(f"label_smoothing doit être dans [0, 1), reçu : {label_smoothing}")
+        if reduction not in ('mean', 'sum', 'none'):
+            raise ValueError(f"reduction doit être 'mean', 'sum' ou 'none', reçu : {reduction}")
 
-        self.pos_weight = pos_weight
-        self.reduction = reduction
+        # register_buffer : pos_weight suit .to(device) / .cuda() / state_dict()
+        if pos_weight is not None:
+            self.register_buffer('pos_weight', pos_weight)
+        else:
+            self.pos_weight = None
+
+        self.reduction      = reduction
         self.label_smoothing = label_smoothing
-        self.class_names = class_names or ['Eau', 'Nuages']
+        self.class_names    = class_names or ['Eau', 'Nuages']
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _smooth(self, labels: torch.Tensor) -> torch.Tensor:
-        """Applique le label smoothing: 1 → (1-ε), 0 → ε/2."""
-        if self.label_smoothing > 0:
-            return labels * (1 - self.label_smoothing) + self.label_smoothing / 2
+        """Label smoothing symétrique : 1 → (1 − ε), 0 → ε/2."""
+        if self.label_smoothing > 0.0:
+            return labels * (1.0 - self.label_smoothing) + self.label_smoothing / 2.0
         return labels
+
+    @staticmethod
+    def _check_shapes(predictions: torch.Tensor, labels: torch.Tensor) -> None:
+        if predictions.shape != labels.shape:
+            raise ValueError(
+                f"Shape mismatch : predictions={tuple(predictions.shape)}, "
+                f"labels={tuple(labels.shape)}"
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def forward(
         self,
         predictions: torch.Tensor,
         labels: torch.Tensor,
-        masks: Optional[torch.Tensor] = None
+        masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            predictions: (batch, 2) ou (batch, seq_len, 2) — logits bruts
+            predictions: (batch, C) ou (batch, seq_len, C) — logits bruts
             labels:      même shape que predictions
-            masks:       (batch,) ou (batch, seq_len) — 1=valide, 0=padding
-                        None si pas de padding
+            masks:       (batch,) ou (batch, seq_len) — 1=valide, 0=padding.
+                         Ignoré (avec avertissement) si predictions est 2D.
+        Returns:
+            Scalaire si reduction != 'none', sinon tenseur de même shape que predictions.
         """
-        assert predictions.shape == labels.shape, (
-            f"Shape mismatch: predictions={predictions.shape}, labels={labels.shape}"
-        )
+        self._check_shapes(predictions, labels)
 
-        # Cas sans masque ou CNN (batch, 2) → pas de padding à gérer
-        if masks is None or predictions.dim() == 2:
+        is_2d = predictions.dim() == 2
+
+        # Masque sur input 2D : cas impossible, on prévient plutôt que d'ignorer en silence
+        if masks is not None and is_2d:
+            raise ValueError(
+                "Les masques (masks) ne sont supportés qu'avec des inputs 3D (batch, seq_len, C). "
+                "Pour un input 2D (batch, C), passez masks=None."
+            )
+
+        # ── Cas 2D ou sans masque ────────────────────────────────────────────
+        if is_2d or masks is None:
             return F.binary_cross_entropy_with_logits(
                 predictions,
                 self._smooth(labels.float()),
                 pos_weight=self.pos_weight,
-                reduction=self.reduction
+                reduction=self.reduction,
             )
 
-        # Cas séquence (batch, seq_len, 2) avec masque
+        # ── Cas 3D avec masque ───────────────────────────────────────────────
         valid_mask = masks.unsqueeze(-1).expand_as(predictions).bool()
 
         loss = F.binary_cross_entropy_with_logits(
             predictions[valid_mask],
             self._smooth(labels[valid_mask].float()),
             pos_weight=self.pos_weight,
-            reduction='none'
+            reduction='none',
         )
 
         if self.reduction == 'mean':
             return loss.mean()
-        elif self.reduction == 'sum':
+        if self.reduction == 'sum':
             return loss.sum()
-        else:
-            out = torch.zeros_like(predictions)
-            out[valid_mask] = loss
-            return out
+        # 'none' : reconstituer un tenseur de même shape avec 0 sur les positions masquées
+        out = torch.zeros_like(predictions)
+        out[valid_mask] = loss
+        return out
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def compute_class_losses(
         self,
         predictions: torch.Tensor,
         labels: torch.Tensor,
-        masks: Optional[torch.Tensor] = None
+        masks: Optional[torch.Tensor] = None,
     ) -> dict:
-        """Retourne les losses par classe + loss totale (pour monitoring)."""
-        if masks is None:
-            masks = torch.ones(predictions.shape[:2], device=predictions.device)
+        """Retourne les losses par classe + loss totale (monitoring uniquement, pas le backward).
 
-        valid_mask = masks.bool()
+        Compatible 2D (batch, C) et 3D (batch, seq_len, C).
+        """
+        self._check_shapes(predictions, labels)
+        is_2d = predictions.dim() == 2
+
+        if is_2d and masks is not None:
+            raise ValueError("masks n'est pas supporté avec des inputs 2D.")
+
         losses = {}
 
         for i, name in enumerate(self.class_names):
+            if is_2d:
+                preds_i = predictions[:, i]
+                lbls_i  = labels[:, i]
+            else:
+                # Masque : (batch, seq_len) → bool
+                if masks is not None:
+                    valid = masks.bool()
+                    preds_i = predictions[:, :, i][valid]
+                    lbls_i  = labels[:, :, i][valid]
+                else:
+                    preds_i = predictions[:, :, i].reshape(-1)
+                    lbls_i  = labels[:, :, i].reshape(-1)
+
             losses[f'loss_{name.lower()}'] = F.binary_cross_entropy_with_logits(
-                predictions[:, :, i][valid_mask],
-                self._smooth(labels[:, :, i][valid_mask].float()),
-                reduction='mean'
+                preds_i,
+                self._smooth(lbls_i.float()),
+                reduction='mean',
             ).item()
 
         losses['loss_total'] = self.forward(predictions, labels, masks).item()

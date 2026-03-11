@@ -1,97 +1,103 @@
 #!/usr/bin/env python3
 """Script d'entraînement principal.
 
-Usage: python main.py [--spectra PATH] [--aux PATH] [--targets PATH]
+Usage: python main.py [--config PATH]
 """
 import argparse
+import warnings
 from pathlib import Path
 import json
 import numpy as np
-import torch
-from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
 import pandas as pd
-from tqdm import tqdm
 
 from training.config import Config, get_config_object
 from training.training import Trainer
 from training.utils import set_seed
-
 from models.dataset import ExoplanetDataset, collate_fn
 from sklearn.model_selection import train_test_split
-from models.CNN import CNN 
+from models.CNN import CNN
 from models.ResNetCNN import ResNet1D
+from torch.utils.data import DataLoader
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITAIRES
+# ─────────────────────────────────────────────────────────────────────────────
 
 class NumpyEncoder(json.JSONEncoder):
-    """Encodeur JSON personnalisé pour gérer les types NumPy."""
+    """Encodeur JSON pour les types NumPy."""
     def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
+        if isinstance(obj, np.integer):  return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray):  return obj.tolist()
         return super().default(obj)
 
-def build_dataloaders(config):
-    """
-    """
-    data_cfg = config.data
 
-    spectra_path  = Path(data_cfg.spectra_train_path)
-    aux_path      = Path(data_cfg.auxiliary_train_path)
-    targets_path  = Path(data_cfg.targets_train_path)
+# ─────────────────────────────────────────────────────────────────────────────
+# DONNÉES
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_path(configured: Path, fallback: Path, label: str) -> Path:
+    """Retourne le path configuré s'il existe, sinon le fallback avec un avertissement."""
+    if configured.exists():
+        return configured
+    warnings.warn(
+        f"[build_dataloaders] '{label}' introuvable : {configured}\n"
+        f"  → Fallback vers : {fallback}",
+        UserWarning, stacklevel=3,
+    )
+    if not fallback.exists():
+        raise FileNotFoundError(f"Fallback introuvable : {fallback}")
+    return fallback
+
+
+def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
+    """Construit les DataLoaders train/val avec split stratifié.
+
+    Returns:
+        (train_loader, val_loader, dataset_info) où dataset_info contient
+        spectrum_length et auxiliary_dim pour construire le modèle sans
+        garder le dataset entier en mémoire dans main().
+    """
+    data_cfg     = config.data
     fallback_root = Path('Défi-IA-2026') / 'DATA' / 'defi-ia-cnes'
-    if not spectra_path.exists():
-        spectra_path = fallback_root / 'spectra.npy'
-    if not aux_path.exists():
-        aux_path     = fallback_root / 'auxiliary.csv'
-    if not targets_path.exists():
-        targets_path = fallback_root / 'targets.csv'
 
-    print(f"Using spectra:    {spectra_path}")
-    print(f"Using auxiliary:  {aux_path}")
-    print(f"Using targets:    {targets_path}")
+    spectra_path  = _resolve_path(Path(data_cfg.spectra_train_path),   fallback_root / 'spectra.npy',    'spectra')
+    aux_path      = _resolve_path(Path(data_cfg.auxiliary_train_path),  fallback_root / 'auxiliary.csv',  'auxiliary')
+    targets_path  = _resolve_path(Path(data_cfg.targets_train_path),    fallback_root / 'targets.csv',    'targets')
 
-    spectra_all    = np.load(spectra_path)        # (N, 52, 3)
+    print(f"  spectra   : {spectra_path}")
+    print(f"  auxiliary : {aux_path}")
+    print(f"  targets   : {targets_path}")
+
+    spectra_all    = np.load(spectra_path)
     aux_df_all     = pd.read_csv(aux_path)
     targets_df_all = pd.read_csv(targets_path)
 
-    n_samples = len(spectra_all)
-
-    indices = list(range(n_samples))
-    
-    strat_labels = (
-    targets_df_all['eau'].astype(str) + "_" + 
-    targets_df_all['nuage'].astype(str)
-)
+    # Split stratifié sur la combinaison (eau, nuage)
+    strat_labels = targets_df_all['eau'].astype(str) + "_" + targets_df_all['nuage'].astype(str)
+    indices      = list(range(len(spectra_all)))
     train_idx, val_idx = train_test_split(
         indices,
-        test_size=1 - data_cfg.train_ratio,
-        random_state=42,
-        stratify=strat_labels 
+        test_size    = 1 - data_cfg.train_ratio,
+        random_state = 42,
+        stratify     = strat_labels,
     )
 
-    spectra_train = spectra_all[train_idx]
-    spectra_val   = spectra_all[val_idx]
+    spectra_train   = spectra_all[train_idx]
+    spectra_val     = spectra_all[val_idx]
+    aux_train       = aux_df_all.iloc[train_idx].reset_index(drop=True)
+    aux_val         = aux_df_all.iloc[val_idx].reset_index(drop=True)
+    targets_train   = targets_df_all.iloc[train_idx].reset_index(drop=True)
+    targets_val     = targets_df_all.iloc[val_idx].reset_index(drop=True)
 
-    aux_train = aux_df_all.iloc[train_idx].reset_index(drop=True)
-    aux_val   = aux_df_all.iloc[val_idx].reset_index(drop=True)
-
-    targets_train = targets_df_all.iloc[train_idx].reset_index(drop=True)
-    targets_val   = targets_df_all.iloc[val_idx].reset_index(drop=True)
-    
-    # Après ton split, affiche ça :
-    print("=== Distribution TRAIN ===")
-    print(targets_train['eau'].value_counts(normalize=True))
-    print(targets_train['nuage'].value_counts(normalize=True))
-
-    print("=== Distribution VAL ===")
-    print(targets_val['eau'].value_counts(normalize=True))
-    print(targets_val['nuage'].value_counts(normalize=True))
-
+    print("\n=== Distribution TRAIN ===")
+    print(targets_train['eau'].value_counts(normalize=True).to_string())
+    print(targets_train['nuage'].value_counts(normalize=True).to_string())
+    print("\n=== Distribution VAL ===")
+    print(targets_val['eau'].value_counts(normalize=True).to_string())
+    print(targets_val['nuage'].value_counts(normalize=True).to_string())
 
     train_dataset = ExoplanetDataset(
         spectra              = spectra_train,
@@ -104,801 +110,471 @@ def build_dataloaders(config):
         noise_std            = data_cfg.noise_std,
         flip_prob            = data_cfg.flip_prob,
         channel_dropout_prob = data_cfg.channel_dropout_prob,
-
     )
-
     val_dataset = ExoplanetDataset(
-        spectra              = spectra_val,
-        auxiliary_df         = aux_val,
-        targets_df           = targets_val,
-        is_train             = False,      
-        augmentation_factor  = 0,     
-        # ↓ stats issues du train uniquement (pas de leakage)
-        aux_mean             = train_dataset.aux_mean,
-        aux_std              = train_dataset.aux_std
+        spectra      = spectra_val,
+        auxiliary_df = aux_val,
+        targets_df   = targets_val,
+        is_train     = False,
+        augmentation_factor = 0,
+        aux_mean     = train_dataset.aux_mean,   # pas de leakage
+        aux_std      = train_dataset.aux_std,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
+    loader_kwargs = dict(
         batch_size  = config.training.batch_size,
-        shuffle     = True,
         num_workers = data_cfg.num_workers,
         pin_memory  = data_cfg.pin_memory,
         collate_fn  = collate_fn,
     )
+    train_loader = DataLoader(train_dataset, shuffle=True,  **loader_kwargs)
+    val_loader   = DataLoader(val_dataset,   shuffle=False, **loader_kwargs)
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size  = config.training.batch_size,
-        shuffle     = False,
-        num_workers = data_cfg.num_workers,
-        pin_memory  = data_cfg.pin_memory,
-        collate_fn  = collate_fn,
+    # Extraire les dimensions ici pour éviter de garder le dataset en RAM dans main()
+    dataset_info = {
+        'spectrum_length': train_dataset.spectra.shape[1],
+        'auxiliary_dim':   train_dataset.aux_features.shape[1],
+    }
+    # Libérer les références numpy brutes — le dataset garde ce dont il a besoin
+    del spectra_all
+
+    return train_loader, val_loader, dataset_info
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODÈLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_model(cfg, spectrum_length: int, auxiliary_dim: int):
+    """Instancie le modèle selon la config."""
+    arch = cfg.model.architecture
+    common = dict(
+        spectrum_length = spectrum_length,
+        auxiliary_dim   = auxiliary_dim,
+        num_classes     = cfg.training.num_classes,
+        input_channels  = 3,
+        dropout         = cfg.model.dropout,
     )
+    if arch == "CNN":
+        print("  Architecture : CNN")
+        return CNN(
+            **common,
+            conv_channels  = cfg.model.conv_channels,
+            kernel_sizes   = cfg.model.kernel_sizes,
+            pool_sizes      = cfg.model.pool_sizes,
+            fc_dims        = cfg.model.fc_dims,
+            use_batch_norm = cfg.model.use_batch_norm,
+        )
+    else:
+        print("  Architecture : ResNet1D")
+        return ResNet1D(
+            **common,
+            block_type  = 'basic',
+            num_blocks  = [2, 2, 2, 2],
+            base_channels = 64,
+        )
 
-    return train_loader, val_loader, train_dataset
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPHIQUES — helper commun
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _plot_pair(ax, epochs, train_vals, val_vals, title: str, ylabel: str,
+               ylim=None, train_color='#3498db', val_color='#e74c3c',
+               ref_lines: list = None):
+    """Trace une courbe train/val sur un axe matplotlib.
+    Factorisé pour éviter les ~20 blocs identiques dans plot_training_results.
+    """
+    ax.plot(epochs, train_vals, label='Train',      linewidth=2, marker='o', markersize=5, color=train_color)
+    ax.plot(epochs, val_vals,   label='Validation', linewidth=2, marker='s', markersize=5, color=val_color)
+    if ref_lines:
+        for y, color, ls, lbl in ref_lines:
+            ax.axhline(y=y, color=color, linestyle=ls, alpha=0.6, label=lbl)
+    ax.set_title(title, fontsize=13, fontweight='bold')
+    ax.set_xlabel('Epoch', fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    if ylim:
+        ax.set_ylim(ylim)
+
+
+def _get(history: dict, key: str) -> list:
+    """Retourne history[key] ou une liste vide si absent."""
+    return history.get(key, [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPHIQUES
+# ─────────────────────────────────────────────────────────────────────────────
 
 def plot_training_results(history: dict, save_dir: str = 'results'):
-    """Crée tous les graphiques d'entraînement avec métriques enrichies."""
+    """Crée la figure agrégée (4×3) et les graphiques individuels."""
     Path(save_dir).mkdir(parents=True, exist_ok=True)
-
-    # Figure principale élargie - 5x3 grille (ajout MCC)
-    fig = plt.figure(figsize=(28, 30))  # hauteur augmentée pour la 5ème ligne
-
     epochs = range(1, len(history['train_loss']) + 1)
 
-    # 1. Loss par itération (train)
-    ax1 = plt.subplot(5, 3, 1)
-    if 'iteration_losses' in history and len(history['iteration_losses']) > 0:
-        ax1.plot(history['iteration_losses'], linewidth=1, alpha=0.7, color='#3498db')
-        ax1.set_xlabel('Itération', fontsize=12)
-        ax1.set_ylabel('Loss', fontsize=12)
-        ax1.set_title('Loss Train (par itération)', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
+    fig, axes = plt.subplots(4, 3, figsize=(26, 22))
+    axs = axes.flatten()
 
-    # 2. Loss par epoch
-    ax2 = plt.subplot(5, 3, 2)
-    ax2.plot(epochs, history['train_loss'], label='Train', linewidth=2,
-            marker='o', markersize=6, color='#3498db')
-    ax2.plot(epochs, history['val_loss'], label='Validation', linewidth=2,
-            marker='s', markersize=6, color='#e74c3c')
-    ax2.set_xlabel('Epoch', fontsize=12)
-    ax2.set_ylabel('Loss', fontsize=12)
-    ax2.set_title('Loss (par epoch)', fontsize=14, fontweight='bold')
-    ax2.legend(fontsize=11)
-    ax2.grid(True, alpha=0.3)
+    # 1 — Loss par itération
+    ax = axs[0]
+    iters = _get(history, 'iteration_losses')
+    if iters:
+        ax.plot(iters, linewidth=1, alpha=0.7, color='#3498db')
+        ax.set_title('Loss Train (par itération)', fontsize=13, fontweight='bold')
+        ax.set_xlabel('Itération', fontsize=11)
+        ax.set_ylabel('Loss', fontsize=11)
+        ax.grid(True, alpha=0.3)
 
-    # 3. Accuracy
-    ax3 = plt.subplot(5, 3, 3)
-    if 'train_accuracy' in history:
-        ax3.plot(epochs, history['train_accuracy'], label='Train', linewidth=2,
-                marker='o', markersize=6, color='#2ecc71')
-        ax3.plot(epochs, history['val_accuracy'], label='Validation', linewidth=2,
-                marker='s', markersize=6, color='#f39c12')
-        ax3.set_xlabel('Epoch', fontsize=12)
-        ax3.set_ylabel('Accuracy', fontsize=12)
-        ax3.set_title('Accuracy', fontsize=14, fontweight='bold')
-        ax3.legend(fontsize=11)
-        ax3.grid(True, alpha=0.3)
-        ax3.set_ylim([0, 1])
+    # 2 — Loss par epoch
+    _plot_pair(axs[1], epochs, history['train_loss'], history['val_loss'], 'Loss', 'Loss')
 
-    # 4. Precision
-    ax4 = plt.subplot(5, 3, 4)
-    if 'train_precision' in history:
-        ax4.plot(epochs, history['train_precision'], label='Train Precision', linewidth=2,
-                marker='o', markersize=6, color='#9b59b6')
-        ax4.plot(epochs, history['val_precision'], label='Val Precision', linewidth=2,
-                marker='s', markersize=6, color='#e67e22')
-        ax4.set_xlabel('Epoch', fontsize=12)
-        ax4.set_ylabel('Precision', fontsize=12)
-        ax4.set_title('Precision', fontsize=14, fontweight='bold')
-        ax4.legend(fontsize=11)
-        ax4.grid(True, alpha=0.3)
-        ax4.set_ylim([0, 1])
+    # 3 — Accuracy
+    if _get(history, 'train_accuracy'):
+        _plot_pair(axs[2], epochs, history['train_accuracy'], history['val_accuracy'],
+                   'Accuracy', 'Accuracy', ylim=[0, 1])
 
-    # 5. Recall
-    ax5 = plt.subplot(5, 3, 5)
-    if 'train_recall' in history:
-        ax5.plot(epochs, history['train_recall'], label='Train Recall', linewidth=2,
-                marker='o', markersize=6, color='#1abc9c')
-        ax5.plot(epochs, history['val_recall'], label='Val Recall', linewidth=2,
-                marker='s', markersize=6, color='#e74c3c')
-        ax5.set_xlabel('Epoch', fontsize=12)
-        ax5.set_ylabel('Recall', fontsize=12)
-        ax5.set_title('Recall', fontsize=14, fontweight='bold')
-        ax5.legend(fontsize=11)
-        ax5.grid(True, alpha=0.3)
-        ax5.set_ylim([0, 1])
+    # 4 — Precision
+    if _get(history, 'train_precision'):
+        _plot_pair(axs[3], epochs, history['train_precision'], history['val_precision'],
+                   'Precision', 'Precision', ylim=[0, 1])
 
-    # 6. F1 Score
-    ax6 = plt.subplot(5, 3, 6)
-    if 'train_f1' in history:
-        ax6.plot(epochs, history['train_f1'], label='Train F1', linewidth=2,
-                marker='o', markersize=6, color='#2ecc71')
-        ax6.plot(epochs, history['val_f1'], label='Val F1', linewidth=2,
-                marker='s', markersize=6, color='#f39c12')
-        ax6.set_xlabel('Epoch', fontsize=12)
-        ax6.set_ylabel('F1 Score', fontsize=12)
-        ax6.set_title('F1 Score', fontsize=14, fontweight='bold')
-        ax6.legend(fontsize=11)
-        ax6.grid(True, alpha=0.3)
-        ax6.set_ylim([0, 1])
+    # 5 — Recall
+    if _get(history, 'train_recall'):
+        _plot_pair(axs[4], epochs, history['train_recall'], history['val_recall'],
+                   'Recall', 'Recall', ylim=[0, 1])
 
-    # 7. Learning Rate
-    ax7 = plt.subplot(5, 3, 7)
-    if 'learning_rates' in history and len(history['learning_rates']) > 0:
-        ax7.plot(epochs, history['learning_rates'], linewidth=2,
-                marker='o', markersize=6, color='#e74c3c')
-        ax7.set_xlabel('Epoch', fontsize=12)
-        ax7.set_ylabel('Learning Rate', fontsize=12)
-        ax7.set_title('Learning Rate', fontsize=14, fontweight='bold')
-        ax7.set_yscale('log')
-        ax7.grid(True, alpha=0.3)
+    # 6 — F1
+    if _get(history, 'train_f1'):
+        _plot_pair(axs[5], epochs, history['train_f1'], history['val_f1'],
+                   'F1 Score', 'F1', ylim=[0, 1])
 
-    # 8. AUC
-    ax8 = plt.subplot(5, 3, 8)
-    if 'train_auc' in history:
-        train_auc = [x if x is not None else np.nan for x in history['train_auc']]
-        val_auc = [x if x is not None else np.nan for x in history['val_auc']]
-        ax8.plot(epochs, train_auc, label='Train AUC', linewidth=2,
-                marker='o', markersize=6, color='#3498db')
-        ax8.plot(epochs, val_auc, label='Val AUC', linewidth=2,
-                marker='s', markersize=6, color='#e74c3c')
-        ax8.set_xlabel('Epoch', fontsize=12)
-        ax8.set_ylabel('AUC', fontsize=12)
-        ax8.set_title('Area Under Curve (ROC)', fontsize=14, fontweight='bold')
-        ax8.legend(fontsize=11)
-        ax8.grid(True, alpha=0.3)
-        ax8.set_ylim([0, 1])
+    # 7 — Balanced Accuracy
+    if _get(history, 'train_balanced_accuracy'):
+        _plot_pair(axs[6], epochs, history['train_balanced_accuracy'], history['val_balanced_accuracy'],
+                   'Balanced Accuracy', 'Bal. Acc', ylim=[0, 1])
 
-    # 9. Specificity
-    ax9 = plt.subplot(5, 3, 9)
-    if 'train_specificity' in history:
-        ax9.plot(epochs, history['train_specificity'], label='Train Specificity', linewidth=2,
-                marker='o', markersize=6, color='#8e44ad')
-        ax9.plot(epochs, history['val_specificity'], label='Val Specificity', linewidth=2,
-                marker='s', markersize=6, color='#c0392b')
-        ax9.set_xlabel('Epoch', fontsize=12)
-        ax9.set_ylabel('Specificity', fontsize=12)
-        ax9.set_title('Specificity (True Negative Rate)', fontsize=14, fontweight='bold')
-        ax9.legend(fontsize=11)
-        ax9.grid(True, alpha=0.3)
-        ax9.set_ylim([0, 1])
+    # 8 — Specificity
+    if _get(history, 'train_specificity'):
+        _plot_pair(axs[7], epochs, history['train_specificity'], history['val_specificity'],
+                   'Specificity', 'Specificity', ylim=[0, 1])
 
-    # 10. Confusion Matrix Elements (Train)
-    ax10 = plt.subplot(5, 3, 10)
-    if 'train_true_positives' in history:
-        ax10.plot(epochs, history['train_true_positives'], label='True Positives',
-                 linewidth=2, marker='o', color='#27ae60')
-        ax10.plot(epochs, history['train_false_positives'], label='False Positives',
-                 linewidth=2, marker='s', color='#e67e22')
-        ax10.plot(epochs, history['train_true_negatives'], label='True Negatives',
-                 linewidth=2, marker='^', color='#3498db')
-        ax10.plot(epochs, history['train_false_negatives'], label='False Negatives',
-                 linewidth=2, marker='v', color='#e74c3c')
-        ax10.set_xlabel('Epoch', fontsize=12)
-        ax10.set_ylabel('Count', fontsize=12)
-        ax10.set_title('Confusion Matrix Elements (Train)', fontsize=14, fontweight='bold')
-        ax10.legend(fontsize=9, loc='best')
-        ax10.grid(True, alpha=0.3)
+    # 9 — AUROC
+    if _get(history, 'train_auroc'):
+        _plot_pair(axs[8], epochs, history['train_auroc'], history['val_auroc'],
+                   'AUROC', 'AUROC', ylim=[0, 1])
 
-    # 11. Balanced Accuracy
-    ax11 = plt.subplot(5, 3, 11)
-    if 'train_balanced_accuracy' in history:
-        ax11.plot(epochs, history['train_balanced_accuracy'], label='Train Balanced Acc',
-                 linewidth=2, marker='o', markersize=6, color='#16a085')
-        ax11.plot(epochs, history['val_balanced_accuracy'], label='Val Balanced Acc',
-                 linewidth=2, marker='s', markersize=6, color='#d35400')
-        ax11.set_xlabel('Epoch', fontsize=12)
-        ax11.set_ylabel('Balanced Accuracy', fontsize=12)
-        ax11.set_title('Balanced Accuracy', fontsize=14, fontweight='bold')
-        ax11.legend(fontsize=11)
-        ax11.grid(True, alpha=0.3)
-        ax11.set_ylim([0, 1])
+    # 10 — MCC
+    if _get(history, 'train_mcc'):
+        _plot_pair(axs[9], epochs, history['train_mcc'], history['val_mcc'],
+                   'Matthews Correlation Coefficient', 'MCC', ylim=[-1, 1],
+                   ref_lines=[(0, 'gray', '--', 'Aléatoire (0)')])
 
-    # ═══════════════════════════════════════════════
-    # 12. MCC (Matthews Correlation Coefficient) ← NOUVEAU
-    # ═══════════════════════════════════════════════
-    ax12 = plt.subplot(5, 3, 12)
-    if 'train_mcc' in history:
-        train_mcc = [x if x is not None else np.nan for x in history['train_mcc']]
-        val_mcc = [x if x is not None else np.nan for x in history['val_mcc']]
-        ax12.plot(epochs, train_mcc, label='Train MCC', linewidth=2,
-                 marker='o', markersize=6, color='#2980b9')
-        ax12.plot(epochs, val_mcc, label='Val MCC', linewidth=2,
-                 marker='s', markersize=6, color='#c0392b')
-        # Ligne de référence à 0 (prédiction aléatoire)
-        ax12.axhline(y=0, color='gray', linestyle='--', alpha=0.6, label='Aléatoire (MCC=0)')
-        ax12.set_xlabel('Epoch', fontsize=12)
-        ax12.set_ylabel('MCC', fontsize=12)
-        ax12.set_title('Matthews Correlation Coefficient', fontsize=14, fontweight='bold')
-        ax12.legend(fontsize=11)
-        ax12.grid(True, alpha=0.3)
-        ax12.set_ylim([-1, 1])  # MCC ∈ [-1, 1]
+    # 11 — Composite Score
+    if _get(history, 'train_composite_score'):
+        _plot_pair(axs[10], epochs, history['train_composite_score'], history['val_composite_score'],
+                   'Composite Score', 'Score')
 
-    # 13. Métriques finales en barres (comparaison Train vs Val)
-    ax13 = plt.subplot(5, 3, 13)
-    metrics_names = []
-    train_values = []
-    val_values = []
-
+    # 12 — Bar chart métriques finales
+    ax = axs[11]
     metric_keys = [
-        ('accuracy', 'Accuracy'),
-        ('precision', 'Precision'),
-        ('recall', 'Recall'),
-        ('f1', 'F1'),
-        ('specificity', 'Specificity'),
-        ('balanced_accuracy', 'Bal. Acc'),
-        ('mcc', 'MCC')           # ← MCC inclus dans le bar chart
+        ('accuracy', 'Acc'), ('precision', 'Prec'), ('recall', 'Rec'),
+        ('f1', 'F1'), ('specificity', 'Spec'), ('balanced_accuracy', 'BalAcc'), ('mcc', 'MCC'),
     ]
-
-    for key, name in metric_keys:
-        if f'val_{key}' in history:
-            metrics_names.append(name)
-            train_values.append(history[f'train_{key}'][-1] if f'train_{key}' in history else 0)
-            val_values.append(history[f'val_{key}'][-1])
-
-    if metrics_names:
-        x = np.arange(len(metrics_names))
-        width = 0.35
-
-        bars1 = ax13.bar(x - width/2, train_values, width, label='Train',
-                        color='#3498db', edgecolor='black', linewidth=1.5)
-        bars2 = ax13.bar(x + width/2, val_values, width, label='Validation',
-                        color='#e74c3c', edgecolor='black', linewidth=1.5)
-
-        ax13.set_xticks(x)
-        ax13.set_xticklabels(metrics_names, fontsize=10, rotation=15)
-        ax13.set_ylabel('Valeur', fontsize=12)
-        ax13.set_title('Comparaison Métriques Finales', fontsize=14, fontweight='bold')
-        ax13.legend(fontsize=11)
-        ax13.grid(True, alpha=0.3, axis='y')
-        # Étendu à [-1, 1.1] pour accueillir la MCC qui peut être négative
-        ax13.set_ylim([-1, 1.1])
-        ax13.axhline(y=0, color='black', linewidth=0.8, alpha=0.5)
-
-        for bars in [bars1, bars2]:
+    names, train_vals, val_vals = [], [], []
+    for key, label in metric_keys:
+        if _get(history, f'val_{key}'):
+            names.append(label)
+            train_vals.append(_get(history, f'train_{key}')[-1] if _get(history, f'train_{key}') else 0)
+            val_vals.append(history[f'val_{key}'][-1])
+    if names:
+        x, w = np.arange(len(names)), 0.35
+        b1 = ax.bar(x - w/2, train_vals, w, label='Train',      color='#3498db', edgecolor='black')
+        b2 = ax.bar(x + w/2, val_vals,   w, label='Validation', color='#e74c3c', edgecolor='black')
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, fontsize=10, rotation=15)
+        ax.set_title('Métriques Finales (Train vs Val)', fontsize=13, fontweight='bold')
+        ax.set_ylim([-1, 1.1])
+        ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3, axis='y')
+        for bars in [b1, b2]:
             for bar in bars:
-                height = bar.get_height()
-                va = 'bottom' if height >= 0 else 'top'
-                ax13.text(bar.get_x() + bar.get_width()/2., height,
-                         f'{height:.3f}', ha='center', va=va,
-                         fontsize=8, fontweight='bold')
+                h = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., h, f'{h:.3f}',
+                        ha='center', va='bottom' if h >= 0 else 'top', fontsize=8)
 
     plt.tight_layout()
-    plt.savefig(f'{save_dir}/training_history.png', dpi=100, bbox_inches='tight')
-    print(f" Graphiques sauvegardés dans '{save_dir}/training_history.png'")
+    out = f'{save_dir}/training_history.png'
+    plt.savefig(out, dpi=100, bbox_inches='tight')
     plt.close()
+    print(f"  Figure agrégée : {out}")
 
-    create_individual_plots(history, epochs, save_dir)
+    _create_individual_plots(history, epochs, save_dir)
 
-def create_individual_plots(history: dict, epochs, save_dir: str):
-    """Crée des graphiques individuels pour chaque métrique principale."""
 
-    # 1. Precision vs Recall
-    if 'train_precision' in history and 'train_recall' in history:
-        plt.figure(figsize=(10, 6))
-        plt.plot(epochs, history['train_precision'], label='Train Precision',
-                linewidth=2, marker='o', color='#9b59b6')
-        plt.plot(epochs, history['val_precision'], label='Val Precision',
-                linewidth=2, marker='s', color='#e67e22')
-        plt.plot(epochs, history['train_recall'], label='Train Recall',
-                linewidth=2, marker='^', color='#1abc9c', linestyle='--')
-        plt.plot(epochs, history['val_recall'], label='Val Recall',
-                linewidth=2, marker='v', color='#e74c3c', linestyle='--')
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Score', fontsize=12)
-        plt.title('Precision et Recall', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=11)
-        plt.grid(True, alpha=0.3)
-        plt.ylim([0, 1])
+def _create_individual_plots(history: dict, epochs, save_dir: str):
+    """Graphiques individuels détaillés."""
+
+    def _save(filename: str):
+        path = f'{save_dir}/{filename}'
         plt.tight_layout()
-        plt.savefig(f'{save_dir}/precision_recall.png', dpi=100, bbox_inches='tight')
+        plt.savefig(path, dpi=100, bbox_inches='tight')
         plt.close()
 
-    # 2. Loss détaillée
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs, history['train_loss'], label='Train Loss',
-            linewidth=2, marker='o', color='#3498db')
-    plt.plot(epochs, history['val_loss'], label='Val Loss',
-            linewidth=2, marker='s', color='#e74c3c')
-    min_train = min(history['train_loss'])
-    min_val = min(history['val_loss'])
-    plt.axhline(y=min_train, color='#3498db', linestyle=':', alpha=0.5,
-                label=f'Min Train: {min_train:.4f}')
-    plt.axhline(y=min_val, color='#e74c3c', linestyle=':', alpha=0.5,
-                label=f'Min Val: {min_val:.4f}')
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Loss', fontsize=12)
-    plt.title('Evolution de la Loss', fontsize=14, fontweight='bold')
-    plt.legend(fontsize=10)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/loss_detailed.png', dpi=100, bbox_inches='tight')
-    plt.close()
+    # Precision & Recall combinés
+    if _get(history, 'train_precision') and _get(history, 'train_recall'):
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for vals, lbl, color, ls in [
+            (history['train_precision'], 'Train Precision', '#9b59b6', '-'),
+            (history['val_precision'],   'Val Precision',   '#e67e22', '-'),
+            (history['train_recall'],    'Train Recall',    '#1abc9c', '--'),
+            (history['val_recall'],      'Val Recall',      '#e74c3c', '--'),
+        ]:
+            ax.plot(epochs, vals, label=lbl, linewidth=2, linestyle=ls)
+        ax.set(title='Precision & Recall', xlabel='Epoch', ylabel='Score', ylim=[0, 1])
+        ax.legend(); ax.grid(True, alpha=0.3)
+        _save('precision_recall.png')
 
-    # 3. Heatmap corrélation métriques
-    if 'val_accuracy' in history:
-        plt.figure(figsize=(10, 8))
+    # Loss détaillée avec min
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(epochs, history['train_loss'], label='Train', linewidth=2, marker='o', color='#3498db')
+    ax.plot(epochs, history['val_loss'],   label='Val',   linewidth=2, marker='s', color='#e74c3c')
+    for vals, color in [(history['train_loss'], '#3498db'), (history['val_loss'], '#e74c3c')]:
+        m = min(vals)
+        ax.axhline(m, color=color, linestyle=':', alpha=0.5, label=f'Min: {m:.4f}')
+    ax.set(title='Évolution de la Loss', xlabel='Epoch', ylabel='Loss')
+    ax.legend(); ax.grid(True, alpha=0.3)
+    _save('loss_detailed.png')
 
-        # ← MCC ajouté à la liste
-        metric_keys = ['accuracy', 'precision', 'recall', 'f1', 'mcc']
-        available_metrics = []
-        metric_names = []
+    # Heatmap corrélation métriques
+    avail = [(k, k.upper() if k == 'mcc' else k.capitalize())
+             for k in ['accuracy', 'precision', 'recall', 'f1', 'mcc', 'balanced_accuracy']
+             if _get(history, f'val_{k}')]
+    if len(avail) >= 2:
+        keys, labels = zip(*avail)
+        corr = np.corrcoef(np.array([history[f'val_{k}'] for k in keys]))
+        fig, ax = plt.subplots(figsize=(9, 7))
+        im = ax.imshow(corr, cmap='RdYlGn', vmin=-1, vmax=1)
+        plt.colorbar(im, ax=ax, label='Corrélation')
+        ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=45)
+        ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels)
+        for i in range(len(labels)):
+            for j in range(len(labels)):
+                ax.text(j, i, f'{corr[i,j]:.2f}', ha='center', va='center', fontweight='bold')
+        ax.set_title('Corrélation entre Métriques (Validation)', fontsize=13, fontweight='bold')
+        _save('metrics_correlation.png')
 
-        for key in metric_keys:
-            if f'val_{key}' in history:
-                available_metrics.append(key)
-                metric_names.append(key.upper() if key == 'mcc' else key.capitalize())
-
-        if len(available_metrics) >= 2:
-            data_matrix = np.array([history[f'val_{key}'] for key in available_metrics])
-            correlation = np.corrcoef(data_matrix)
-
-            im = plt.imshow(correlation, cmap='RdYlGn', vmin=-1, vmax=1, aspect='auto')
-            plt.colorbar(im, label='Corrélation')
-            plt.xticks(range(len(metric_names)), metric_names, rotation=45)
-            plt.yticks(range(len(metric_names)), metric_names)
-
-            for i in range(len(metric_names)):
-                for j in range(len(metric_names)):
-                    plt.text(j, i, f'{correlation[i, j]:.2f}',
-                            ha="center", va="center", color="black", fontweight='bold')
-
-            plt.title('Corrélation entre Métriques (Validation)', fontsize=14, fontweight='bold')
-            plt.tight_layout()
-            plt.savefig(f'{save_dir}/metrics_correlation.png', dpi=100, bbox_inches='tight')
-            plt.close()
-
-    # 4. Ratio Precision/Recall
-    if 'train_precision' in history and 'train_recall' in history:
-        plt.figure(figsize=(10, 6))
-        train_ratio = [p/r if r > 0 else 0 for p, r in
-                      zip(history['train_precision'], history['train_recall'])]
-        val_ratio = [p/r if r > 0 else 0 for p, r in
-                    zip(history['val_precision'], history['val_recall'])]
-        plt.plot(epochs, train_ratio, label='Train Precision/Recall',
-                linewidth=2, marker='o', color='#9b59b6')
-        plt.plot(epochs, val_ratio, label='Val Precision/Recall',
-                linewidth=2, marker='s', color='#e67e22')
-        plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='Équilibre')
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Ratio Precision/Recall', fontsize=12)
-        plt.title('Ratio Precision/Recall', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=11)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(f'{save_dir}/precision_recall_ratio.png', dpi=100, bbox_inches='tight')
-        plt.close()
-
-    # ═══════════════════════════════════════════════
-    # 5. MCC individuel ← NOUVEAU
-    # ═══════════════════════════════════════════════
-    if 'train_mcc' in history:
-        plt.figure(figsize=(10, 6))
-
-        train_mcc = [x if x is not None else np.nan for x in history['train_mcc']]
+    # MCC détaillé avec annotation du meilleur
+    if _get(history, 'train_mcc'):
         val_mcc = [x if x is not None else np.nan for x in history['val_mcc']]
-
-        plt.plot(epochs, train_mcc, label='Train MCC', linewidth=2,
-                marker='o', markersize=6, color='#2980b9')
-        plt.plot(epochs, val_mcc, label='Val MCC', linewidth=2,
-                marker='s', markersize=6, color='#c0392b')
-
-        # Lignes de référence
-        plt.axhline(y=0,  color='gray',  linestyle='--', alpha=0.6, label='Aléatoire (0)')
-        plt.axhline(y=1,  color='green', linestyle=':',  alpha=0.5, label='Parfait (+1)')
-        plt.axhline(y=-1, color='red',   linestyle=':',  alpha=0.5, label='Inversé (-1)')
-
-        # Annoter le meilleur MCC de validation
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(epochs, [x if x is not None else np.nan for x in history['train_mcc']],
+                label='Train MCC', linewidth=2, marker='o', color='#2980b9')
+        ax.plot(epochs, val_mcc, label='Val MCC', linewidth=2, marker='s', color='#c0392b')
+        for y, color, ls, lbl in [(0, 'gray', '--', 'Aléatoire'), (1, 'green', ':', 'Parfait'), (-1, 'red', ':', 'Inversé')]:
+            ax.axhline(y, color=color, linestyle=ls, alpha=0.5, label=lbl)
         if not all(np.isnan(val_mcc)):
-            best_idx = int(np.nanargmax(val_mcc))
-            best_val = val_mcc[best_idx]
-            plt.annotate(
-                f'Best Val MCC\n{best_val:.4f}',
-                xy=(list(epochs)[best_idx], best_val),
-                xytext=(10, -30),
-                textcoords='offset points',
-                arrowprops=dict(arrowstyle='->', color='black'),
-                fontsize=10,
-                fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
-            )
+            bi = int(np.nanargmax(val_mcc))
+            ax.annotate(f'Best Val\n{val_mcc[bi]:.4f}',
+                        xy=(list(epochs)[bi], val_mcc[bi]), xytext=(10, -30),
+                        textcoords='offset points', fontsize=10, fontweight='bold',
+                        arrowprops=dict(arrowstyle='->', color='black'),
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+        ax.set(title='Matthews Correlation Coefficient', xlabel='Epoch', ylabel='MCC', ylim=[-1, 1])
+        ax.legend(); ax.grid(True, alpha=0.3)
+        _save('mcc.png')
 
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('MCC', fontsize=12)
-        plt.title('Matthews Correlation Coefficient (MCC)', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=11)
-        plt.grid(True, alpha=0.3)
-        plt.ylim([-1, 1])
-        plt.tight_layout()
-        plt.savefig(f'{save_dir}/mcc.png', dpi=100, bbox_inches='tight')
-        plt.close()
+    # Confusion matrix elements (val)
+    if all(_get(history, k) for k in ['val_tp', 'val_fp', 'val_tn', 'val_fn']):
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for key, lbl, color, marker in [
+            ('val_tp', 'True Positives',  '#27ae60', 'o'),
+            ('val_fp', 'False Positives', '#e67e22', 's'),
+            ('val_tn', 'True Negatives',  '#3498db', '^'),
+            ('val_fn', 'False Negatives', '#e74c3c', 'v'),
+        ]:
+            ax.plot(epochs, history[key], label=lbl, linewidth=2, marker=marker)
+        ax.set(title='Éléments Matrice de Confusion (Val)', xlabel='Epoch', ylabel='Count')
+        ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+        _save('confusion_matrix_elements.png')
 
-    print(f" Graphiques individuels sauvegardés dans '{save_dir}/'")
+    print(f"  Graphiques individuels : {save_dir}/")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAUVEGARDE CSV + RAPPORT
+# ─────────────────────────────────────────────────────────────────────────────
 
 def save_training_results(history: dict, save_dir: str = 'results'):
-    """Sauvegarde tous les résultats d'entraînement."""
+    """Sauvegarde l'historique complet en CSV (toutes les clés list de l'history)."""
     Path(save_dir).mkdir(parents=True, exist_ok=True)
+    n_epochs = len(history['train_loss'])
 
-    # Historique epochs
-    df_data = {
-        'epoch': range(1, len(history['train_loss']) + 1),
-        'train_loss': history['train_loss'],
-        'val_loss': history['val_loss'],
-    }
+    # On exporte toutes les clés qui ont exactement n_epochs valeurs (= métriques par epoch)
+    df_data = {'epoch': range(1, n_epochs + 1)}
+    for key, vals in history.items():
+        if key == 'iteration_losses':
+            continue
+        if isinstance(vals, list) and len(vals) == n_epochs:
+            df_data[key] = vals
 
-    # Ajouter toutes les métriques disponibles
-    optional_metrics = [
-        'accuracy', 'precision', 'recall', 'f1', 'auc',
-        'specificity', 'balanced_accuracy', 
-        'true_positives', 'false_positives', 
-        'true_negatives', 'false_negatives'
-    ]
-    
-    for metric in optional_metrics:
-        train_key = f'train_{metric}'
-        val_key = f'val_{metric}'
-        if train_key in history:
-            df_data[train_key] = history[train_key]
-        if val_key in history:
-            df_data[val_key] = history[val_key]
+    pd.DataFrame(df_data).to_csv(f'{save_dir}/training_history_epochs.csv', index=False)
+    print(f"  Historique epochs : {save_dir}/training_history_epochs.csv")
 
-    if 'learning_rates' in history:
-        df_data['learning_rate'] = history['learning_rates']
-
-    df_epochs = pd.DataFrame(df_data)
-    df_epochs.to_csv(f'{save_dir}/training_history_epochs.csv', index=False)
-    print(f" Historique (epochs) sauvegardé dans '{save_dir}/training_history_epochs.csv'")
-
-    # Historique itérations
-    if 'iteration_losses' in history and len(history['iteration_losses']) > 0:
-        df_iters = pd.DataFrame({
+    if history.get('iteration_losses'):
+        pd.DataFrame({
             'iteration': range(len(history['iteration_losses'])),
-            'train_loss': history['iteration_losses']
-        })
-        df_iters.to_csv(f'{save_dir}/training_history_iterations.csv', index=False)
-        print(f" Historique (itérations) sauvegardé dans '{save_dir}/training_history_iterations.csv'")
+            'loss':      history['iteration_losses'],
+        }).to_csv(f'{save_dir}/training_history_iterations.csv', index=False)
+        print(f"  Historique itérations : {save_dir}/training_history_iterations.csv")
 
-    # Créer un rapport de synthèse
-    create_summary_report(history, save_dir)
+    _create_summary_report(history, save_dir)
 
-def create_summary_report(history: dict, save_dir: str):
-    """Crée un rapport texte détaillé de l'entraînement."""
+
+def _create_summary_report(history: dict, save_dir: str):
+    """Rapport texte de l'entraînement."""
+    METRICS = ['accuracy', 'precision', 'recall', 'f1', 'specificity',
+               'balanced_accuracy', 'mcc', 'auroc', 'auprc', 'cohen_kappa']
+
+    def _write_epoch_metrics(f, idx: int):
+        for m in METRICS:
+            vk, tk = f'val_{m}', f'train_{m}'
+            if vk in history and idx < len(history[vk]):
+                if tk in history:
+                    f.write(f"  Train {m:20s} {history[tk][idx]:.6f}\n")
+                f.write(f"  Val   {m:20s} {history[vk][idx]:.6f}\n")
+
     report_path = Path(save_dir) / 'training_report.txt'
-    
+    n = len(history['train_loss'])
+
     with open(report_path, 'w', encoding='utf-8') as f:
-        f.write("="*80 + "\n")
-        f.write("RAPPORT D'ENTRAÎNEMENT DÉTAILLÉ\n")
-        f.write("="*80 + "\n\n")
-        
-        num_epochs = len(history['train_loss'])
-        f.write(f"Nombre d'epochs: {num_epochs}\n")
-        
-        if 'iteration_losses' in history:
-            total_iterations = len(history['iteration_losses'])
-            f.write(f"Nombre total d'itérations: {total_iterations:,}\n")
-            if num_epochs > 0:
-                f.write(f"Itérations par epoch: {total_iterations // num_epochs:,}\n")
-        
-        f.write("\n" + "-"*80 + "\n")
-        f.write("MEILLEURE PERFORMANCE (selon val_loss)\n")
-        f.write("-"*80 + "\n")
-        
-        if 'val_loss' in history:
-            best_epoch = np.argmin(history['val_loss']) + 1
-            f.write(f"\nÉpoch: {best_epoch}\n")
-            f.write(f"Train Loss: {history['train_loss'][best_epoch - 1]:.6f}\n")
-            f.write(f"Val Loss:   {history['val_loss'][best_epoch - 1]:.6f}\n\n")
-            
-            metrics = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'specificity', 'balanced_accuracy','mcc']
-            for metric in metrics:
-                train_key = f'train_{metric}'
-                val_key = f'val_{metric}'
-                if val_key in history:
-                    train_val = history[train_key][best_epoch - 1] if train_key in history else None
-                    val_val = history[val_key][best_epoch - 1]
-                    
-                    if train_val is not None:
-                        f.write(f"Train {metric.capitalize()}: {train_val:.6f}\n")
-                    f.write(f"Val {metric.capitalize()}:   {val_val:.6f}\n")
-        
-        f.write("\n" + "-"*80 + "\n")
-        f.write("PERFORMANCE FINALE\n")
-        f.write("-"*80 + "\n")
-        
-        f.write(f"\nÉpoch: {num_epochs}\n")
-        f.write(f"Train Loss: {history['train_loss'][-1]:.6f}\n")
-        f.write(f"Val Loss:   {history['val_loss'][-1]:.6f}\n\n")
-        
-        for metric in metrics:
-            train_key = f'train_{metric}'
-            val_key = f'val_{metric}'
-            if val_key in history:
-                train_val = history[train_key][-1] if train_key in history else None
-                val_val = history[val_key][-1]
-                
-                if train_val is not None:
-                    f.write(f"Train {metric.capitalize()}: {train_val:.6f}\n")
-                f.write(f"Val {metric.capitalize()}:   {val_val:.6f}\n")
-        
-        if num_epochs > 1:
-            f.write("\n" + "-"*80 + "\n")
-            f.write("AMÉLIORATION\n")
-            f.write("-"*80 + "\n\n")
-            
-            loss_improvement = history['train_loss'][0] - history['train_loss'][-1]
-            loss_improvement_pct = (loss_improvement / history['train_loss'][0]) * 100
-            f.write(f"Réduction loss: {loss_improvement:.6f} ({loss_improvement_pct:.2f}%)\n")
-            
-            if 'train_accuracy' in history:
-                acc_improvement = history['train_accuracy'][-1] - history['train_accuracy'][0]
-                acc_improvement_pct = (acc_improvement / history['train_accuracy'][0]) * 100
-                f.write(f"Gain accuracy: {acc_improvement:+.6f} ({acc_improvement_pct:+.2f}%)\n")
-        
+        f.write("="*80 + "\nRAPPORT D'ENTRAÎNEMENT\n" + "="*80 + "\n\n")
+        f.write(f"Epochs : {n}\n")
+        if history.get('iteration_losses'):
+            total = len(history['iteration_losses'])
+            f.write(f"Itérations totales : {total:,}  ({total // n:,} / epoch)\n")
+
+        # Meilleure epoch selon val_loss
+        if history.get('val_loss'):
+            best = int(np.argmin(history['val_loss']))
+            f.write(f"\n{'─'*80}\nMEILLEURE EPOCH (val_loss) : {best + 1}\n{'─'*80}\n")
+            f.write(f"  Train Loss : {history['train_loss'][best]:.6f}\n")
+            f.write(f"  Val   Loss : {history['val_loss'][best]:.6f}\n")
+            _write_epoch_metrics(f, best)
+
+        # Dernière epoch
+        f.write(f"\n{'─'*80}\nDERNIÈRE EPOCH : {n}\n{'─'*80}\n")
+        f.write(f"  Train Loss : {history['train_loss'][-1]:.6f}\n")
+        f.write(f"  Val   Loss : {history['val_loss'][-1]:.6f}\n")
+        _write_epoch_metrics(f, n - 1)
+
+        # Amélioration globale
+        if n > 1:
+            f.write(f"\n{'─'*80}\nAMÉLIORATION (epoch 1 → {n})\n{'─'*80}\n")
+            dl = history['train_loss'][0] - history['train_loss'][-1]
+            f.write(f"  Δ Loss train : {dl:+.6f} ({dl/history['train_loss'][0]*100:+.2f}%)\n")
+            if history.get('train_mcc'):
+                dm = history['val_mcc'][-1] - history['val_mcc'][0]
+                f.write(f"  Δ MCC val    : {dm:+.6f}\n")
+
         f.write("\n" + "="*80 + "\n")
-    
-    print(f" Rapport détaillé sauvegardé dans '{report_path}'")
+
+    print(f"  Rapport : {report_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RÉSUMÉ CONSOLE (post-entraînement)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def print_training_summary(result: dict):
-    """
-    Affiche un résumé détaillé de l'entraînement.
-    
-    Args:
-        result: Dictionnaire retourné par trainer.train() contenant:
-                - best_metrics: dict des meilleures métriques
-                - best_epoch: numéro de la meilleure epoch
-                - final_epoch: numéro de la dernière epoch
-                - training_time: temps total d'entraînement
-                - early_stopped: bool si early stopping activé
-                - history: dict contenant tous les historiques
-    """
-    print("\n" + "="*90)
-    print(" RÉSUMÉ DE L'ENTRAÎNEMENT")
-    print("="*90)
-    
-    # Extraire les données
-    history = result.get('history', {})
+    """Affiche un résumé concis — sans redoubler ce que le Trainer a déjà affiché."""
+    history      = result.get('history', {})
     best_metrics = result.get('best_metrics', {})
-    best_epoch = result.get('best_epoch', 0)
-    final_epoch = result.get('final_epoch', 0)
-    training_time = result.get('training_time', 0)
-    early_stopped = result.get('early_stopped', False)
-    
-    # Informations générales
-    print(f"\n Informations générales:")
-    print(f"   Epochs effectuées:        {final_epoch}")
-    print(f"   Meilleure epoch:          {best_epoch}")
-    print(f"   Temps d'entraînement:     {training_time/3600:.2f}h ({training_time/60:.1f}min)")
-    print(f"   Early stopping:           {' Oui' if early_stopped else '❌ Non'}")
-    
-    if 'iteration_losses' in history:
-        total_iterations = len(history['iteration_losses'])
-        print(f"   Total d'itérations:       {total_iterations:,}")
-        if final_epoch > 0:
-            print(f"   Itérations par epoch:     {total_iterations // final_epoch:,}")
-    
-    # Meilleurs résultats (selon la métrique composite ou MCC)
-    print(f"\n MEILLEURS RÉSULTATS (Epoch {best_epoch}):")
-    print(f"{'='*90}")
-    
-    # Métriques principales
-    print(f"\n   Métriques Principales:")
-    if 'composite_score' in best_metrics:
-        print(f"     Composite Score:      {best_metrics['composite_score']:.4f} ")
-    if 'mcc' in best_metrics:
-        print(f"     MCC:                  {best_metrics['mcc']:.4f}")
-    if 'g_mean' in best_metrics:
-        print(f"     G-Mean:               {best_metrics['g_mean']:.4f}")
-    if 'stability_score' in best_metrics:
-        print(f"     Stability Score:      {best_metrics['stability_score']:.4f}")
-    if 'production_score' in best_metrics:
-        print(f"     Production Score:     {best_metrics['production_score']:.4f}")
-    if 'f_harmonic' in best_metrics:
-        print(f"     F-Harmonic:           {best_metrics['f_harmonic']:.4f}")
-    
-    # Métriques classiques de validation
-    if 'val_accuracy' in history and len(history['val_accuracy']) >= best_epoch:
-        print(f"\n  📊 Métriques Classiques:")
-        idx = best_epoch - 1
-        
-        metrics_map = {
-            'Accuracy': 'val_accuracy',
-            'Balanced Acc': 'val_balanced_accuracy',
-            'Precision': 'val_precision',
-            'Recall': 'val_recall',
-            'Specificity': 'val_specificity',
-            'F1-Score': 'val_f1',
-            'F2-Score': 'val_f2',
-            'IoU': 'val_iou',
-            "Cohen's Kappa": 'val_cohen_kappa',
-            "Matthews Corr": 'val_mcc'
-        }
-        
-        for label, key in metrics_map.items():
-            if key in history and idx < len(history[key]):
-                print(f"     {label:18s} {history[key][idx]:.4f}")
-    
-    # Métriques probabilistes
-    if 'auroc' in best_metrics and best_metrics['auroc'] > 0:
-        print(f"\n  🎲 Métriques Probabilistes:")
-        print(f"     AUROC:                {best_metrics['auroc']:.4f}")
-        if 'val_auprc' in history and len(history['val_auprc']) >= best_epoch:
-            print(f"     AUPRC:                {history['val_auprc'][best_epoch-1]:.4f}")
-        if 'val_brier_score' in history and len(history['val_brier_score']) >= best_epoch:
-            print(f"     Brier Score:          {history['val_brier_score'][best_epoch-1]:.4f}")
-    
-    # Métriques par classe
-    if 'val_class_0_recall' in history and len(history['val_class_0_recall']) >= best_epoch:
-        print(f"\n  🎯 Métriques par Classe:")
-        idx = best_epoch - 1
-        
-        if 'val_class_0_precision' in history:
-            print(f"     Classe 0 - Precision: {history['val_class_0_precision'][idx]:.4f}")
-        print(f"     Classe 0 - Recall:    {history['val_class_0_recall'][idx]:.4f}")
-        
-        if 'val_class_1_precision' in history:
-            print(f"     Classe 1 - Precision: {history['val_class_1_precision'][idx]:.4f}")
-        if 'val_class_1_recall' in history:
-            print(f"     Classe 1 - Recall:    {history['val_class_1_recall'][idx]:.4f}")
-        
-        # Min class recall et balance gap
-        if 'val_min_class_recalls' in history and len(history['val_min_class_recalls']) >= best_epoch:
-            print(f"     Min Class Recall:     {history['val_min_class_recalls'][idx]:.4f}")
-        if 'val_class_balance_gaps' in history and len(history['val_class_balance_gaps']) >= best_epoch:
-            print(f"     Class Balance Gap:    {history['val_class_balance_gaps'][idx]:.4f}")
-    
-    # Support
-    if 'val_support_class_0' in history and len(history['val_support_class_0']) >= best_epoch:
-        print(f"\n  📊 Support:")
-        idx = best_epoch - 1
-        print(f"     Classe 0:             {int(history['val_support_class_0'][idx])}")
-        if 'val_support_class_1' in history:
-            print(f"     Classe 1:             {int(history['val_support_class_1'][idx])}")
-    
-    # Matrice de confusion
-    if all(k in history for k in ['val_tp', 'val_tn', 'val_fp', 'val_fn']):
-        if len(history['val_tp']) >= best_epoch:
-            print(f"\n  📋 Matrice de Confusion:")
-            idx = best_epoch - 1
-            tp = int(history['val_tp'][idx])
-            tn = int(history['val_tn'][idx])
-            fp = int(history['val_fp'][idx])
-            fn = int(history['val_fn'][idx])
-            
-            print(f"     TP: {tp:5d}  |  FP: {fp:5d}")
-            print(f"     FN: {fn:5d}  |  TN: {tn:5d}")
-    
-    # Évolution des pertes
-    if 'train_loss' in history and 'val_loss' in history:
-        if len(history['train_loss']) > 0 and len(history['val_loss']) > 0:
-            print(f"\n📉 ÉVOLUTION DES PERTES:")
-            print(f"{'='*90}")
-            
-            print(f"\n  Première epoch:")
-            print(f"     Train Loss:           {history['train_loss'][0]:.4f}")
-            print(f"     Val Loss:             {history['val_loss'][0]:.4f}")
-            
-            print(f"\n  Dernière epoch:")
-            print(f"     Train Loss:           {history['train_loss'][-1]:.4f}")
-            print(f"     Val Loss:             {history['val_loss'][-1]:.4f}")
-            
-            print(f"\n  Meilleure epoch ({best_epoch}):")
-            idx = best_epoch - 1
-            if idx < len(history['train_loss']):
-                print(f"     Train Loss:           {history['train_loss'][idx]:.4f}")
-            if idx < len(history['val_loss']):
-                print(f"     Val Loss:             {history['val_loss'][idx]:.4f}")
-            
-            # Amélioration
-            if len(history['train_loss']) > 1:
-                loss_improvement = history['train_loss'][0] - history['train_loss'][-1]
-                loss_improvement_pct = (loss_improvement / history['train_loss'][0]) * 100
-                
-                print(f"\n  💡 Amélioration:")
-                print(f"     Réduction loss:       {loss_improvement:.4f} ({loss_improvement_pct:.2f}%)")
-    
-    # Évolution des métriques composites
-    if 'val_composite_scores' in history and len(history['val_composite_scores']) > 0:
-        print(f"\n📊 ÉVOLUTION DES SCORES COMPOSITES:")
-        print(f"{'='*90}")
-        
-        composite_scores = history['val_composite_scores']
-        print(f"\n  Composite Score:")
-        print(f"     Premier:              {composite_scores[0]:.4f}")
-        print(f"     Meilleur:             {max(composite_scores):.4f}")
-        print(f"     Dernier:              {composite_scores[-1]:.4f}")
-        
-        if len(composite_scores) > 1:
-            improvement = composite_scores[-1] - composite_scores[0]
-            print(f"     Amélioration totale:  {improvement:+.4f}")
-    
-    if 'val_g_means' in history and len(history['val_g_means']) > 0:
-        g_means = history['val_g_means']
-        print(f"\n  G-Mean:")
-        print(f"     Premier:              {g_means[0]:.4f}")
-        print(f"     Meilleur:             {max(g_means):.4f}")
-        print(f"     Dernier:              {g_means[-1]:.4f}")
-    
-    print(f"\n{'='*90}\n")
+    best_epoch   = result.get('best_epoch', 0)
+    final_epoch  = result.get('final_epoch', 0)
+    t            = result.get('training_time', 0)
+    idx          = best_epoch - 1
 
+    print(f"\n{'='*90}")
+    print(f" RÉSUMÉ POST-ENTRAÎNEMENT")
+    print(f"{'='*90}")
+    print(f"  Epochs : {final_epoch}  |  Meilleure : {best_epoch}  |  "
+          f"Durée : {t/3600:.2f}h ({t/60:.1f}min)  |  "
+          f"Early stopping : {'Oui' if result.get('early_stopped') else 'Non'}")
+
+    # Métriques classiques à la meilleure epoch
+    classic = {
+        'Accuracy': 'val_accuracy', 'Balanced Acc': 'val_balanced_accuracy',
+        'Precision': 'val_precision', 'Recall': 'val_recall',
+        'Specificity': 'val_specificity', 'F1': 'val_f1', 'F2': 'val_f2',
+        'IoU': 'val_iou', "Cohen κ": 'val_cohen_kappa', 'MCC': 'val_mcc',
+    }
+    print(f"\n  Métriques Val — Epoch {best_epoch}:")
+    for lbl, key in classic.items():
+        if key in history and idx < len(history[key]):
+            print(f"    {lbl:16s} {history[key][idx]:.4f}")
+
+    # Matrice de confusion
+    if all(k in history and idx < len(history[k]) for k in ['val_tp', 'val_tn', 'val_fp', 'val_fn']):
+        tp, tn = int(history['val_tp'][idx]), int(history['val_tn'][idx])
+        fp, fn = int(history['val_fp'][idx]), int(history['val_fn'][idx])
+        print(f"\n  Confusion (Val) :  TP {tp:5d} | FP {fp:5d}")
+        print(f"                     FN {fn:5d} | TN {tn:5d}")
+
+    # Métriques probabilistes
+    if best_metrics.get('auroc', 0) > 0:
+        print(f"\n  Probabilistes :  AUROC {best_metrics['auroc']:.4f}", end='')
+        if 'val_auprc' in history and idx < len(history['val_auprc']):
+            print(f"  |  AUPRC {history['val_auprc'][idx]:.4f}", end='')
+        if 'val_brier_score' in history and idx < len(history['val_brier_score']):
+            print(f"  |  Brier {history['val_brier_score'][idx]:.4f}", end='')
+        print()
+
+    print(f"{'='*90}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default=None)
+    parser = argparse.ArgumentParser(description="Entraînement du modèle exoplanète")
+    parser.add_argument('--config', type=str, default=None, help="Chemin vers la config YAML/JSON")
     args = parser.parse_args()
 
-    if args.config:
-        cfg = Config.load(args.config)
-    else:
-        cfg = get_config_object()
-
+    cfg = Config.load(args.config) if args.config else get_config_object()
     set_seed(cfg.data.random_seed)
-    
     cfg.print_summary()
 
-    train_loader, val_loader, dataset = build_dataloaders(cfg)
+    print("\n── Chargement des données ──")
+    train_loader, val_loader, dataset_info = build_dataloaders(cfg)
 
-    # Construire le modèle
-    spectrum_length = dataset.spectra.shape[1]
-    auxiliary_dim = dataset.aux_features.shape[1]
-    
-    if cfg.model.architecture == "CNN":   
-        print(" Utilisation de CNN comme architecture de modèle.")
-        model = CNN(
-            spectrum_length=spectrum_length,
-            auxiliary_dim=auxiliary_dim,
-            num_classes=cfg.training.num_classes,
-            conv_channels=cfg.model.conv_channels,
-            kernel_sizes=cfg.model.kernel_sizes,
-            pool_sizes=cfg.model.pool_sizes,
-            fc_dims=cfg.model.fc_dims,
-            dropout=cfg.model.dropout,
-            use_batch_norm=cfg.model.use_batch_norm,
-            input_channels=3
-        )
-    else :
-        print(" Utilisation de ResNet1D comme architecture de modèle.")
-        model = ResNet1D(
-        spectrum_length=spectrum_length,
-        auxiliary_dim=auxiliary_dim,
-        num_classes=cfg.training.num_classes,
-        input_channels=3,
-        block_type='basic',
-        num_blocks=[2, 2, 2, 2],
-        base_channels=64,
-        dropout=cfg.model.dropout
-    )
-    
+    print("\n── Construction du modèle ──")
+    model = build_model(cfg, dataset_info['spectrum_length'], dataset_info['auxiliary_dim'])
 
+    print("\n── Initialisation du Trainer ──")
     trainer = Trainer(model, train_loader, val_loader, cfg)
 
-    print("\n🚀 Début de l'entraînement...\n")
-    result = trainer.train()
+    result  = trainer.train()
 
-    # Affichage et sauvegarde des résultats
+    # Résumé concis (le Trainer a déjà affiché le détail complet)
     print_training_summary(result)
 
-    # Extraction de l'historique pour la sauvegarde
-    history = result.get('history', {})
+    # Sauvegarde
+    out_dir  = Path(cfg.results_folder)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    history  = result.get('history', {})
 
-    # Sauvegarde finale de l'historique JSON
-    out_json = Path(cfg.results_folder) / 'training_history.json'
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-
-    # Sauvegarder tout le résultat (pas juste l'history)
-    with open(out_json, 'w') as f:
+    print("\n── Sauvegarde des résultats ──")
+    with open(out_dir / 'training_history.json', 'w') as f:
         json.dump(result, f, indent=2, cls=NumpyEncoder)
+    print(f"  JSON : {out_dir}/training_history.json")
 
-    # Sauvegarde CSV et graphiques (utilise l'history extrait)
-    save_training_results(history, cfg.results_folder)
-    plot_training_results(history, cfg.results_folder)
-    
-    print(f"\n Résultats sauvegardés dans: {cfg.results_folder}")
-    print(f"   - training_history.json")
-    print(f"   - training_results.csv")
-    print(f"   - Graphiques PNG\n")
+    save_training_results(history, str(out_dir))
+    plot_training_results(history, str(out_dir))
+
+    print(f"\n Tout est sauvegardé dans : {out_dir}\n")
 
 
 if __name__ == '__main__':

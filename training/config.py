@@ -25,7 +25,6 @@ class ModelConfig:
     # Commun
     dropout: float = 0.3
     use_batch_norm: bool = True
-    auxiliary_dim: int = 5
     
     def __post_init__(self):
         """Validation."""
@@ -38,9 +37,9 @@ class ModelConfig:
 class TrainingConfig:
     """Configuration de l'entraînement."""
     num_classes: int = 2  # eau, nuages
-    batch_size: int = 64
-    num_epochs: int = 100
-    learning_rate: float = 1e-4
+    batch_size: int = 32
+    num_epochs: int = 500
+    learning_rate: float = 3e-4
     patience: int = 50
     preload: Optional[str] = None
     
@@ -50,22 +49,16 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     
     # Scheduler
-    scheduler_type: str = 'cosine'  # 'cosine', 'step', 'plateau'
     scheduler_pct_start: float = 0.9
     scheduler_div_factor: float = 1
     scheduler_final_div_factor: float = 1
-    min_lr: float = 1e-6
-    
+
     # Early stopping
     min_delta: float = 0.001
     
     # Checkpointing
     save_every_n_epochs: int = 5
     keep_last_n_checkpoints: int = 3
-    
-    # Logging
-    track_iteration_loss: bool = True
-    log_every_n_steps: int = 10
     
     # Loss
     pos_weight: Optional[List[float]] = None  # [weight_eau, weight_nuages]
@@ -113,7 +106,7 @@ class DataConfig:
 
     # Augmentation
     use_augmentation: bool = True
-    augmentation_factor: int = 3         # copies augmentées par échantillon
+    augmentation_factor: int = 0          # copies augmentées par échantillon
     shift_range: float = 0.05             # décalage additif max (fraction de la std)
     scale_range: float = 0.10             # mise à l'échelle multiplicative max
     noise_std: float = 0.02               # écart-type du bruit gaussien

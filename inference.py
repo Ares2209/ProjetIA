@@ -190,8 +190,8 @@ def save_predictions(
     """Sauvegarde les prédictions dans inference_res.csv."""
     df = pd.DataFrame({
         'id':         ids,
-        'prob_eau':   probabilities[:, 0],
-        'prob_nuage': probabilities[:, 1],
+        #'prob_eau':   probabilities[:, 0],
+        #'prob_nuage': probabilities[:, 1],
         'pred_eau':   predictions[:, 0],
         'pred_nuage': predictions[:, 1],
     })
@@ -265,17 +265,12 @@ def main():
     aux_df     = pd.read_csv(args.auxiliary)
     targets_df = pd.read_csv(args.targets) if has_targets else None
 
-    # ── Construction du dataset ───────────────────────────────────────────────
-    # is_train=False  → pas d'augmentation, normalisation per-sample
-    # aux_mean/std=None → stats calculées sur ce dataset (pas de train dispo)
     dataset = ExoplanetDataset(
         spectra              = spectra_np,
         auxiliary_df         = aux_df,
         targets_df           = targets_df,
         is_train             = False,
         augmentation_factor  = 0,
-        # Pas de stats externes : per-sample pour les spectres,
-        # et normalisation auxiliaire autonome (inférence standalone)
         aux_mean             = None,
         aux_std              = None,
     )
