@@ -11,13 +11,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from training.LightGBM import LightGBM
 from training.config import Config, get_config_object
 from training.training import Trainer
+from training.TrainingGBM import LightGBMTrainer
 from training.utils import set_seed
 from models.dataset import ExoplanetDataset, collate_fn
 from sklearn.model_selection import train_test_split
 from models.CNN import CNN
-from models.ResNetCNN import ResNet1D
+from models.ResNetCNN import ResNet1D, resnet18_1d, resnet34_1d, resnet8_1d
 from torch.utils.data import DataLoader
 
 
@@ -53,19 +55,13 @@ def _resolve_path(configured: Path, fallback: Path, label: str) -> Path:
 
 
 def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
-    """Construit les DataLoaders train/val avec split stratifié.
-
-    Returns:
-        (train_loader, val_loader, dataset_info) où dataset_info contient
-        spectrum_length et auxiliary_dim pour construire le modèle sans
-        garder le dataset entier en mémoire dans main().
-    """
-    data_cfg     = config.data
+    """Construit les DataLoaders train/val avec split stratifié."""
+    data_cfg      = config.data
     fallback_root = Path('Défi-IA-2026') / 'DATA' / 'defi-ia-cnes'
 
-    spectra_path  = _resolve_path(Path(data_cfg.spectra_train_path),   fallback_root / 'spectra.npy',    'spectra')
-    aux_path      = _resolve_path(Path(data_cfg.auxiliary_train_path),  fallback_root / 'auxiliary.csv',  'auxiliary')
-    targets_path  = _resolve_path(Path(data_cfg.targets_train_path),    fallback_root / 'targets.csv',    'targets')
+    spectra_path  = _resolve_path(Path(data_cfg.spectra_train_path),  fallback_root / 'spectra.npy',   'spectra')
+    aux_path      = _resolve_path(Path(data_cfg.auxiliary_train_path), fallback_root / 'auxiliary.csv', 'auxiliary')
+    targets_path  = _resolve_path(Path(data_cfg.targets_train_path),   fallback_root / 'targets.csv',   'targets')
 
     print(f"  spectra   : {spectra_path}")
     print(f"  auxiliary : {aux_path}")
@@ -75,7 +71,6 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
     aux_df_all     = pd.read_csv(aux_path)
     targets_df_all = pd.read_csv(targets_path)
 
-    # Split stratifié sur la combinaison (eau, nuage)
     strat_labels = targets_df_all['eau'].astype(str) + "_" + targets_df_all['nuage'].astype(str)
     indices      = list(range(len(spectra_all)))
     train_idx, val_idx = train_test_split(
@@ -85,12 +80,12 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
         stratify     = strat_labels,
     )
 
-    spectra_train   = spectra_all[train_idx]
-    spectra_val     = spectra_all[val_idx]
-    aux_train       = aux_df_all.iloc[train_idx].reset_index(drop=True)
-    aux_val         = aux_df_all.iloc[val_idx].reset_index(drop=True)
-    targets_train   = targets_df_all.iloc[train_idx].reset_index(drop=True)
-    targets_val     = targets_df_all.iloc[val_idx].reset_index(drop=True)
+    spectra_train = spectra_all[train_idx]
+    spectra_val   = spectra_all[val_idx]
+    aux_train     = aux_df_all.iloc[train_idx].reset_index(drop=True)
+    aux_val       = aux_df_all.iloc[val_idx].reset_index(drop=True)
+    targets_train = targets_df_all.iloc[train_idx].reset_index(drop=True)
+    targets_val   = targets_df_all.iloc[val_idx].reset_index(drop=True)
 
     print("\n=== Distribution TRAIN ===")
     print(targets_train['eau'].value_counts(normalize=True).to_string())
@@ -112,13 +107,13 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
         channel_dropout_prob = data_cfg.channel_dropout_prob,
     )
     val_dataset = ExoplanetDataset(
-        spectra      = spectra_val,
-        auxiliary_df = aux_val,
-        targets_df   = targets_val,
-        is_train     = False,
+        spectra             = spectra_val,
+        auxiliary_df        = aux_val,
+        targets_df          = targets_val,
+        is_train            = False,
         augmentation_factor = 0,
-        aux_mean     = train_dataset.aux_mean,   # pas de leakage
-        aux_std      = train_dataset.aux_std,
+        aux_mean            = train_dataset.aux_mean,
+        aux_std             = train_dataset.aux_std,
     )
 
     loader_kwargs = dict(
@@ -130,49 +125,96 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
     train_loader = DataLoader(train_dataset, shuffle=True,  **loader_kwargs)
     val_loader   = DataLoader(val_dataset,   shuffle=False, **loader_kwargs)
 
-    # Extraire les dimensions ici pour éviter de garder le dataset en RAM dans main()
     dataset_info = {
         'spectrum_length': train_dataset.spectra.shape[1],
         'auxiliary_dim':   train_dataset.aux_features.shape[1],
     }
-    # Libérer les références numpy brutes — le dataset garde ce dont il a besoin
     del spectra_all
-
     return train_loader, val_loader, dataset_info
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODÈLE
-# ─────────────────────────────────────────────────────────────────────────────
 
 def build_model(cfg, spectrum_length: int, auxiliary_dim: int):
     """Instancie le modèle selon la config."""
     arch = cfg.model.architecture
-    common = dict(
+
+    # Paramètres communs à tous les modèles PyTorch
+    common_torch = dict(
         spectrum_length = spectrum_length,
         auxiliary_dim   = auxiliary_dim,
         num_classes     = cfg.training.num_classes,
         input_channels  = 3,
         dropout         = cfg.model.dropout,
     )
+
     if arch == "CNN":
         print("  Architecture : CNN")
         return CNN(
-            **common,
+            **common_torch,
             conv_channels  = cfg.model.conv_channels,
             kernel_sizes   = cfg.model.kernel_sizes,
-            pool_sizes      = cfg.model.pool_sizes,
+            pool_sizes     = cfg.model.pool_sizes,
             fc_dims        = cfg.model.fc_dims,
             use_batch_norm = cfg.model.use_batch_norm,
         )
-    else:
-        print("  Architecture : ResNet1D")
-        return ResNet1D(
-            **common,
-            block_type  = 'basic',
-            num_blocks  = [2, 2, 2, 2],
-            base_channels = 64,
+
+    elif arch == "ResNet8":
+        print("  Architecture : ResNet-8")
+        return resnet8_1d(**common_torch)
+
+    elif arch == "ResNet18":
+        print("  Architecture : ResNet-18")
+        return resnet18_1d(**common_torch)
+
+    elif arch == "ResNet34":
+        print("  Architecture : ResNet-34 (⚠ risque surapprentissage)")
+        return resnet34_1d(**common_torch)
+
+    elif arch == "LightGBM":
+        # ── LightGBM : pas de dropout, pas de batch_norm, paramètres dédiés ──
+        print("  Architecture : LightGBM")
+        return LightGBM(
+            spectrum_length        = spectrum_length,
+            auxiliary_dim          = auxiliary_dim,
+            num_classes            = cfg.training.num_classes,
+            input_channels         = 3,
+            # Hyperparamètres boosting (lus depuis cfg.model s'ils existent)
+            n_estimators           = getattr(cfg.model, 'n_estimators',    500),
+            learning_rate          = getattr(cfg.model, 'lgbm_lr',         0.05),
+            num_leaves             = getattr(cfg.model, 'num_leaves',       63),
+            max_depth              = getattr(cfg.model, 'max_depth',        -1),
+            min_child_samples      = getattr(cfg.model, 'min_child_samples', 20),
+            subsample              = getattr(cfg.model, 'subsample',        0.8),
+            colsample_bytree       = getattr(cfg.model, 'colsample_bytree', 0.8),
+            reg_alpha              = getattr(cfg.model, 'reg_alpha',        0.1),
+            reg_lambda             = getattr(cfg.model, 'reg_lambda',       0.1),
+            # Feature engineering
+            use_pca                = getattr(cfg.model, 'use_pca',               False),
+            pca_components         = getattr(cfg.model, 'pca_components',        50),
+            use_statistical_features = getattr(cfg.model, 'use_statistical_features', True),
+            use_diff_features      = getattr(cfg.model, 'use_diff_features',     True),
+            random_state           = cfg.data.random_seed,
         )
+
+    else:
+        raise ValueError(
+            f"Architecture inconnue : '{arch}'. "
+            f"Valeurs valides : CNN | ResNet8 | ResNet18 | ResNet34 | LightGBM"
+        )
+
+
+def _select_trainer(model, train_loader, val_loader, cfg):
+    """
+    Retourne le bon Trainer selon le type de modèle.
+
+    - LightGBM → LightGBMTrainer  (pas de backprop, pas de scheduler)
+    - Tout modèle PyTorch nn.Module → Trainer classique
+    """
+    if isinstance(model, LightGBM):
+        print("  Trainer : LightGBMTrainer")
+        return LightGBMTrainer(model, train_loader, val_loader, cfg)
+    else:
+        print("  Trainer : Trainer (PyTorch)")
+        return Trainer(model, train_loader, val_loader, cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,11 +224,12 @@ def build_model(cfg, spectrum_length: int, auxiliary_dim: int):
 def _plot_pair(ax, epochs, train_vals, val_vals, title: str, ylabel: str,
                ylim=None, train_color='#3498db', val_color='#e74c3c',
                ref_lines: list = None):
-    """Trace une courbe train/val sur un axe matplotlib.
-    Factorisé pour éviter les ~20 blocs identiques dans plot_training_results.
-    """
-    ax.plot(epochs, train_vals, label='Train',      linewidth=2, marker='o', markersize=5, color=train_color)
-    ax.plot(epochs, val_vals,   label='Validation', linewidth=2, marker='s', markersize=5, color=val_color)
+    """Trace une courbe train/val sur un axe matplotlib."""
+    if train_vals:
+        ax.plot(epochs, train_vals, label='Train',      linewidth=2,
+                marker='o', markersize=5, color=train_color)
+    ax.plot(epochs, val_vals, label='Validation', linewidth=2,
+            marker='s', markersize=5, color=val_color)
     if ref_lines:
         for y, color, ls, lbl in ref_lines:
             ax.axhline(y=y, color=color, linestyle=ls, alpha=0.6, label=lbl)
@@ -209,14 +252,22 @@ def _get(history: dict, key: str) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_training_results(history: dict, save_dir: str = 'results'):
-    """Crée la figure agrégée (4×3) et les graphiques individuels."""
+    """Crée la figure agrégée et les graphiques individuels."""
     Path(save_dir).mkdir(parents=True, exist_ok=True)
-    epochs = range(1, len(history['train_loss']) + 1)
+
+    # LightGBM n'a qu'une seule "epoch" et pas de train_loss
+    # → on utilise val_loss comme référence de longueur si train_loss absent
+    ref_series = _get(history, 'train_loss') or _get(history, 'val_loss')
+    if not ref_series:
+        print("  Aucune donnée d'historique à tracer.")
+        return
+
+    epochs = range(1, len(ref_series) + 1)
 
     fig, axes = plt.subplots(4, 3, figsize=(26, 22))
     axs = axes.flatten()
 
-    # 1 — Loss par itération
+    # 1 — Loss par itération (absent pour LightGBM)
     ax = axs[0]
     iters = _get(history, 'iteration_losses')
     if iters:
@@ -225,54 +276,67 @@ def plot_training_results(history: dict, save_dir: str = 'results'):
         ax.set_xlabel('Itération', fontsize=11)
         ax.set_ylabel('Loss', fontsize=11)
         ax.grid(True, alpha=0.3)
+    else:
+        ax.set_visible(False)
 
     # 2 — Loss par epoch
-    _plot_pair(axs[1], epochs, history['train_loss'], history['val_loss'], 'Loss', 'Loss')
+    _plot_pair(axs[1], epochs,
+               _get(history, 'train_loss'), _get(history, 'val_loss'),
+               'Loss', 'Loss')
 
     # 3 — Accuracy
-    if _get(history, 'train_accuracy'):
-        _plot_pair(axs[2], epochs, history['train_accuracy'], history['val_accuracy'],
+    if _get(history, 'val_accuracy'):
+        _plot_pair(axs[2], epochs,
+                   _get(history, 'train_accuracy'), _get(history, 'val_accuracy'),
                    'Accuracy', 'Accuracy', ylim=[0, 1])
 
     # 4 — Precision
-    if _get(history, 'train_precision'):
-        _plot_pair(axs[3], epochs, history['train_precision'], history['val_precision'],
+    if _get(history, 'val_precision'):
+        _plot_pair(axs[3], epochs,
+                   _get(history, 'train_precision'), _get(history, 'val_precision'),
                    'Precision', 'Precision', ylim=[0, 1])
 
     # 5 — Recall
-    if _get(history, 'train_recall'):
-        _plot_pair(axs[4], epochs, history['train_recall'], history['val_recall'],
+    if _get(history, 'val_recall'):
+        _plot_pair(axs[4], epochs,
+                   _get(history, 'train_recall'), _get(history, 'val_recall'),
                    'Recall', 'Recall', ylim=[0, 1])
 
     # 6 — F1
-    if _get(history, 'train_f1'):
-        _plot_pair(axs[5], epochs, history['train_f1'], history['val_f1'],
+    if _get(history, 'val_f1'):
+        _plot_pair(axs[5], epochs,
+                   _get(history, 'train_f1'), _get(history, 'val_f1'),
                    'F1 Score', 'F1', ylim=[0, 1])
 
     # 7 — Balanced Accuracy
-    if _get(history, 'train_balanced_accuracy'):
-        _plot_pair(axs[6], epochs, history['train_balanced_accuracy'], history['val_balanced_accuracy'],
+    if _get(history, 'val_balanced_accuracy'):
+        _plot_pair(axs[6], epochs,
+                   _get(history, 'train_balanced_accuracy'), _get(history, 'val_balanced_accuracy'),
                    'Balanced Accuracy', 'Bal. Acc', ylim=[0, 1])
 
     # 8 — Specificity
-    if _get(history, 'train_specificity'):
-        _plot_pair(axs[7], epochs, history['train_specificity'], history['val_specificity'],
+    if _get(history, 'val_specificity'):
+        _plot_pair(axs[7], epochs,
+                   _get(history, 'train_specificity'), _get(history, 'val_specificity'),
                    'Specificity', 'Specificity', ylim=[0, 1])
 
     # 9 — AUROC
-    if _get(history, 'train_auroc'):
-        _plot_pair(axs[8], epochs, history['train_auroc'], history['val_auroc'],
+    if _get(history, 'val_auroc'):
+        _plot_pair(axs[8], epochs,
+                   _get(history, 'train_auroc'), _get(history, 'val_auroc'),
                    'AUROC', 'AUROC', ylim=[0, 1])
 
     # 10 — MCC
-    if _get(history, 'train_mcc'):
-        _plot_pair(axs[9], epochs, history['train_mcc'], history['val_mcc'],
+    if _get(history, 'val_mcc'):
+        _plot_pair(axs[9], epochs,
+                   _get(history, 'train_mcc'), _get(history, 'val_mcc'),
                    'Matthews Correlation Coefficient', 'MCC', ylim=[-1, 1],
                    ref_lines=[(0, 'gray', '--', 'Aléatoire (0)')])
 
     # 11 — Composite Score
-    if _get(history, 'train_composite_score'):
-        _plot_pair(axs[10], epochs, history['train_composite_score'], history['val_composite_score'],
+    if _get(history, 'val_composite_score'):
+        _plot_pair(axs[10], epochs,
+                   _get(history, 'train_composite_score'), _get(history, 'val_composite_score'),
                    'Composite Score', 'Score')
 
     # 12 — Bar chart métriques finales
@@ -283,26 +347,35 @@ def plot_training_results(history: dict, save_dir: str = 'results'):
     ]
     names, train_vals, val_vals = [], [], []
     for key, label in metric_keys:
-        if _get(history, f'val_{key}'):
+        vk = f'val_{key}'
+        if _get(history, vk):
             names.append(label)
-            train_vals.append(_get(history, f'train_{key}')[-1] if _get(history, f'train_{key}') else 0)
-            val_vals.append(history[f'val_{key}'][-1])
+            tk = f'train_{key}'
+            train_vals.append(_get(history, tk)[-1] if _get(history, tk) else None)
+            val_vals.append(history[vk][-1])
     if names:
         x, w = np.arange(len(names)), 0.35
-        b1 = ax.bar(x - w/2, train_vals, w, label='Train',      color='#3498db', edgecolor='black')
-        b2 = ax.bar(x + w/2, val_vals,   w, label='Validation', color='#e74c3c', edgecolor='black')
+        if any(v is not None for v in train_vals):
+            b1 = ax.bar(x - w/2,
+                        [v if v is not None else 0 for v in train_vals],
+                        w, label='Train', color='#3498db', edgecolor='black')
+            for bar, v in zip(b1, train_vals):
+                if v is not None:
+                    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                            f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+        b2 = ax.bar(x + w/2 if any(v is not None for v in train_vals) else x,
+                    val_vals, w, label='Validation', color='#e74c3c', edgecolor='black')
         ax.set_xticks(x)
         ax.set_xticklabels(names, fontsize=10, rotation=15)
-        ax.set_title('Métriques Finales (Train vs Val)', fontsize=13, fontweight='bold')
+        ax.set_title('Métriques Finales (Val)', fontsize=13, fontweight='bold')
         ax.set_ylim([-1, 1.1])
         ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3, axis='y')
-        for bars in [b1, b2]:
-            for bar in bars:
-                h = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., h, f'{h:.3f}',
-                        ha='center', va='bottom' if h >= 0 else 'top', fontsize=8)
+        for bar in b2:
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., h, f'{h:.3f}',
+                    ha='center', va='bottom' if h >= 0 else 'top', fontsize=8)
 
     plt.tight_layout()
     out = f'{save_dir}/training_history.png'
@@ -323,29 +396,36 @@ def _create_individual_plots(history: dict, epochs, save_dir: str):
         plt.close()
 
     # Precision & Recall combinés
-    if _get(history, 'train_precision') and _get(history, 'train_recall'):
+    if _get(history, 'val_precision') and _get(history, 'val_recall'):
         fig, ax = plt.subplots(figsize=(10, 6))
-        for vals, lbl, color, ls in [
-            (history['train_precision'], 'Train Precision', '#9b59b6', '-'),
-            (history['val_precision'],   'Val Precision',   '#e67e22', '-'),
-            (history['train_recall'],    'Train Recall',    '#1abc9c', '--'),
-            (history['val_recall'],      'Val Recall',      '#e74c3c', '--'),
-        ]:
-            ax.plot(epochs, vals, label=lbl, linewidth=2, linestyle=ls)
+        series = [
+            (_get(history, 'train_precision'), 'Train Precision', '#9b59b6', '-'),
+            (_get(history, 'val_precision'),   'Val Precision',   '#e67e22', '-'),
+            (_get(history, 'train_recall'),    'Train Recall',    '#1abc9c', '--'),
+            (_get(history, 'val_recall'),      'Val Recall',      '#e74c3c', '--'),
+        ]
+        for vals, lbl, color, ls in series:
+            if vals:
+                ax.plot(epochs, vals, label=lbl, linewidth=2, linestyle=ls, color=color)
         ax.set(title='Precision & Recall', xlabel='Epoch', ylabel='Score', ylim=[0, 1])
         ax.legend(); ax.grid(True, alpha=0.3)
         _save('precision_recall.png')
 
-    # Loss détaillée avec min
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(epochs, history['train_loss'], label='Train', linewidth=2, marker='o', color='#3498db')
-    ax.plot(epochs, history['val_loss'],   label='Val',   linewidth=2, marker='s', color='#e74c3c')
-    for vals, color in [(history['train_loss'], '#3498db'), (history['val_loss'], '#e74c3c')]:
-        m = min(vals)
-        ax.axhline(m, color=color, linestyle=':', alpha=0.5, label=f'Min: {m:.4f}')
-    ax.set(title='Évolution de la Loss', xlabel='Epoch', ylabel='Loss')
-    ax.legend(); ax.grid(True, alpha=0.3)
-    _save('loss_detailed.png')
+    # Loss détaillée
+    train_loss = _get(history, 'train_loss')
+    val_loss   = _get(history, 'val_loss')
+    if val_loss:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        if train_loss:
+            ax.plot(epochs, train_loss, label='Train', linewidth=2, marker='o', color='#3498db')
+            ax.axhline(min(train_loss), color='#3498db', linestyle=':', alpha=0.5,
+                       label=f'Min Train: {min(train_loss):.4f}')
+        ax.plot(epochs, val_loss, label='Val', linewidth=2, marker='s', color='#e74c3c')
+        ax.axhline(min(val_loss), color='#e74c3c', linestyle=':', alpha=0.5,
+                   label=f'Min Val: {min(val_loss):.4f}')
+        ax.set(title='Évolution de la Loss', xlabel='Epoch', ylabel='Loss')
+        ax.legend(); ax.grid(True, alpha=0.3)
+        _save('loss_detailed.png')
 
     # Heatmap corrélation métriques
     avail = [(k, k.upper() if k == 'mcc' else k.capitalize())
@@ -365,14 +445,15 @@ def _create_individual_plots(history: dict, epochs, save_dir: str):
         ax.set_title('Corrélation entre Métriques (Validation)', fontsize=13, fontweight='bold')
         _save('metrics_correlation.png')
 
-    # MCC détaillé avec annotation du meilleur
-    if _get(history, 'train_mcc'):
+    # MCC détaillé
+    if _get(history, 'val_mcc'):
         val_mcc = [x if x is not None else np.nan for x in history['val_mcc']]
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(epochs, [x if x is not None else np.nan for x in history['train_mcc']],
-                label='Train MCC', linewidth=2, marker='o', color='#2980b9')
+        if _get(history, 'train_mcc'):
+            ax.plot(epochs, [x if x is not None else np.nan for x in history['train_mcc']],
+                    label='Train MCC', linewidth=2, marker='o', color='#2980b9')
         ax.plot(epochs, val_mcc, label='Val MCC', linewidth=2, marker='s', color='#c0392b')
-        for y, color, ls, lbl in [(0, 'gray', '--', 'Aléatoire'), (1, 'green', ':', 'Parfait'), (-1, 'red', ':', 'Inversé')]:
+        for y, color, ls, lbl in [(0, 'gray', '--', 'Aléatoire'), (1, 'green', ':', 'Parfait')]:
             ax.axhline(y, color=color, linestyle=ls, alpha=0.5, label=lbl)
         if not all(np.isnan(val_mcc)):
             bi = int(np.nanargmax(val_mcc))
@@ -381,11 +462,12 @@ def _create_individual_plots(history: dict, epochs, save_dir: str):
                         textcoords='offset points', fontsize=10, fontweight='bold',
                         arrowprops=dict(arrowstyle='->', color='black'),
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
-        ax.set(title='Matthews Correlation Coefficient', xlabel='Epoch', ylabel='MCC', ylim=[-1, 1])
+        ax.set(title='Matthews Correlation Coefficient', xlabel='Epoch',
+               ylabel='MCC', ylim=[-1, 1])
         ax.legend(); ax.grid(True, alpha=0.3)
         _save('mcc.png')
 
-    # Confusion matrix elements (val)
+    # Confusion matrix (absent pour LightGBM history)
     if all(_get(history, k) for k in ['val_tp', 'val_fp', 'val_tn', 'val_fn']):
         fig, ax = plt.subplots(figsize=(10, 6))
         for key, lbl, color, marker in [
@@ -407,11 +489,16 @@ def _create_individual_plots(history: dict, epochs, save_dir: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_training_results(history: dict, save_dir: str = 'results'):
-    """Sauvegarde l'historique complet en CSV (toutes les clés list de l'history)."""
+    """Sauvegarde l'historique complet en CSV."""
     Path(save_dir).mkdir(parents=True, exist_ok=True)
-    n_epochs = len(history['train_loss'])
 
-    # On exporte toutes les clés qui ont exactement n_epochs valeurs (= métriques par epoch)
+    # Référence de longueur : train_loss si dispo, sinon val_loss (cas LightGBM)
+    ref_key = 'train_loss' if _get(history, 'train_loss') else 'val_loss'
+    n_epochs = len(_get(history, ref_key))
+    if n_epochs == 0:
+        print("  Historique vide — pas de CSV à écrire.")
+        return
+
     df_data = {'epoch': range(1, n_epochs + 1)}
     for key, vals in history.items():
         if key == 'iteration_losses':
@@ -429,10 +516,10 @@ def save_training_results(history: dict, save_dir: str = 'results'):
         }).to_csv(f'{save_dir}/training_history_iterations.csv', index=False)
         print(f"  Historique itérations : {save_dir}/training_history_iterations.csv")
 
-    _create_summary_report(history, save_dir)
+    _create_summary_report(history, save_dir, n_epochs)
 
 
-def _create_summary_report(history: dict, save_dir: str):
+def _create_summary_report(history: dict, save_dir: str, n_epochs: int):
     """Rapport texte de l'entraînement."""
     METRICS = ['accuracy', 'precision', 'recall', 'f1', 'specificity',
                'balanced_accuracy', 'mcc', 'auroc', 'auprc', 'cohen_kappa']
@@ -441,40 +528,41 @@ def _create_summary_report(history: dict, save_dir: str):
         for m in METRICS:
             vk, tk = f'val_{m}', f'train_{m}'
             if vk in history and idx < len(history[vk]):
-                if tk in history:
+                if _get(history, tk):
                     f.write(f"  Train {m:20s} {history[tk][idx]:.6f}\n")
                 f.write(f"  Val   {m:20s} {history[vk][idx]:.6f}\n")
 
     report_path = Path(save_dir) / 'training_report.txt'
-    n = len(history['train_loss'])
 
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("="*80 + "\nRAPPORT D'ENTRAÎNEMENT\n" + "="*80 + "\n\n")
-        f.write(f"Epochs : {n}\n")
+        f.write(f"Epochs : {n_epochs}\n")
         if history.get('iteration_losses'):
             total = len(history['iteration_losses'])
-            f.write(f"Itérations totales : {total:,}  ({total // n:,} / epoch)\n")
+            f.write(f"Itérations totales : {total:,}  ({total // n_epochs:,} / epoch)\n")
 
-        # Meilleure epoch selon val_loss
-        if history.get('val_loss'):
+        # Meilleure epoch selon val_loss (si disponible)
+        if _get(history, 'val_loss'):
             best = int(np.argmin(history['val_loss']))
             f.write(f"\n{'─'*80}\nMEILLEURE EPOCH (val_loss) : {best + 1}\n{'─'*80}\n")
-            f.write(f"  Train Loss : {history['train_loss'][best]:.6f}\n")
+            if _get(history, 'train_loss'):
+                f.write(f"  Train Loss : {history['train_loss'][best]:.6f}\n")
             f.write(f"  Val   Loss : {history['val_loss'][best]:.6f}\n")
             _write_epoch_metrics(f, best)
 
         # Dernière epoch
-        f.write(f"\n{'─'*80}\nDERNIÈRE EPOCH : {n}\n{'─'*80}\n")
-        f.write(f"  Train Loss : {history['train_loss'][-1]:.6f}\n")
-        f.write(f"  Val   Loss : {history['val_loss'][-1]:.6f}\n")
-        _write_epoch_metrics(f, n - 1)
+        f.write(f"\n{'─'*80}\nDERNIÈRE EPOCH : {n_epochs}\n{'─'*80}\n")
+        if _get(history, 'train_loss'):
+            f.write(f"  Train Loss : {history['train_loss'][-1]:.6f}\n")
+        if _get(history, 'val_loss'):
+            f.write(f"  Val   Loss : {history['val_loss'][-1]:.6f}\n")
+        _write_epoch_metrics(f, n_epochs - 1)
 
-        # Amélioration globale
-        if n > 1:
-            f.write(f"\n{'─'*80}\nAMÉLIORATION (epoch 1 → {n})\n{'─'*80}\n")
+        if n_epochs > 1 and _get(history, 'train_loss'):
+            f.write(f"\n{'─'*80}\nAMÉLIORATION (epoch 1 → {n_epochs})\n{'─'*80}\n")
             dl = history['train_loss'][0] - history['train_loss'][-1]
             f.write(f"  Δ Loss train : {dl:+.6f} ({dl/history['train_loss'][0]*100:+.2f}%)\n")
-            if history.get('train_mcc'):
+            if _get(history, 'val_mcc'):
                 dm = history['val_mcc'][-1] - history['val_mcc'][0]
                 f.write(f"  Δ MCC val    : {dm:+.6f}\n")
 
@@ -484,15 +572,15 @@ def _create_summary_report(history: dict, save_dir: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RÉSUMÉ CONSOLE (post-entraînement)
+# RÉSUMÉ CONSOLE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_training_summary(result: dict):
-    """Affiche un résumé concis — sans redoubler ce que le Trainer a déjà affiché."""
+    """Affiche un résumé concis post-entraînement."""
     history      = result.get('history', {})
     best_metrics = result.get('best_metrics', {})
-    best_epoch   = result.get('best_epoch', 0)
-    final_epoch  = result.get('final_epoch', 0)
+    best_epoch   = result.get('best_epoch', 1)
+    final_epoch  = result.get('final_epoch', 1)
     t            = result.get('training_time', 0)
     idx          = best_epoch - 1
 
@@ -503,7 +591,6 @@ def print_training_summary(result: dict):
           f"Durée : {t/3600:.2f}h ({t/60:.1f}min)  |  "
           f"Early stopping : {'Oui' if result.get('early_stopped') else 'Non'}")
 
-    # Métriques classiques à la meilleure epoch
     classic = {
         'Accuracy': 'val_accuracy', 'Balanced Acc': 'val_balanced_accuracy',
         'Precision': 'val_precision', 'Recall': 'val_recall',
@@ -512,23 +599,25 @@ def print_training_summary(result: dict):
     }
     print(f"\n  Métriques Val — Epoch {best_epoch}:")
     for lbl, key in classic.items():
-        if key in history and idx < len(history[key]):
-            print(f"    {lbl:16s} {history[key][idx]:.4f}")
+        vals = _get(history, key)
+        if vals and idx < len(vals):
+            print(f"    {lbl:16s} {vals[idx]:.4f}")
 
-    # Matrice de confusion
-    if all(k in history and idx < len(history[k]) for k in ['val_tp', 'val_tn', 'val_fp', 'val_fn']):
-        tp, tn = int(history['val_tp'][idx]), int(history['val_tn'][idx])
-        fp, fn = int(history['val_fp'][idx]), int(history['val_fn'][idx])
+    if all(_get(history, k) and idx < len(_get(history, k))
+           for k in ['val_tp', 'val_tn', 'val_fp', 'val_fn']):
+        tp = int(history['val_tp'][idx]); tn = int(history['val_tn'][idx])
+        fp = int(history['val_fp'][idx]); fn = int(history['val_fn'][idx])
         print(f"\n  Confusion (Val) :  TP {tp:5d} | FP {fp:5d}")
         print(f"                     FN {fn:5d} | TN {tn:5d}")
 
-    # Métriques probabilistes
     if best_metrics.get('auroc', 0) > 0:
         print(f"\n  Probabilistes :  AUROC {best_metrics['auroc']:.4f}", end='')
-        if 'val_auprc' in history and idx < len(history['val_auprc']):
-            print(f"  |  AUPRC {history['val_auprc'][idx]:.4f}", end='')
-        if 'val_brier_score' in history and idx < len(history['val_brier_score']):
-            print(f"  |  Brier {history['val_brier_score'][idx]:.4f}", end='')
+        auprc = _get(history, 'val_auprc')
+        if auprc and idx < len(auprc):
+            print(f"  |  AUPRC {auprc[idx]:.4f}", end='')
+        brier = _get(history, 'val_brier_score')
+        if brier and idx < len(brier):
+            print(f"  |  Brier {brier[idx]:.4f}", end='')
         print()
 
     print(f"{'='*90}\n")
@@ -554,17 +643,15 @@ def main():
     model = build_model(cfg, dataset_info['spectrum_length'], dataset_info['auxiliary_dim'])
 
     print("\n── Initialisation du Trainer ──")
-    trainer = Trainer(model, train_loader, val_loader, cfg)
+    trainer = _select_trainer(model, train_loader, val_loader, cfg)  # ← routage automatique
 
-    result  = trainer.train()
+    result = trainer.train()
 
-    # Résumé concis (le Trainer a déjà affiché le détail complet)
     print_training_summary(result)
 
-    # Sauvegarde
-    out_dir  = Path(cfg.results_folder)
+    out_dir = Path(cfg.results_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
-    history  = result.get('history', {})
+    history = result.get('history', {})
 
     print("\n── Sauvegarde des résultats ──")
     with open(out_dir / 'training_history.json', 'w') as f:

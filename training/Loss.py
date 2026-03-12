@@ -36,7 +36,6 @@ class BCE(nn.Module):
         if reduction not in ('mean', 'sum', 'none'):
             raise ValueError(f"reduction doit être 'mean', 'sum' ou 'none', reçu : {reduction}")
 
-        # register_buffer : pos_weight suit .to(device) / .cuda() / state_dict()
         if pos_weight is not None:
             self.register_buffer('pos_weight', pos_weight)
         else:
@@ -45,8 +44,6 @@ class BCE(nn.Module):
         self.reduction      = reduction
         self.label_smoothing = label_smoothing
         self.class_names    = class_names or ['Eau', 'Nuages']
-
-    # ─────────────────────────────────────────────────────────────────────────
 
     def _smooth(self, labels: torch.Tensor) -> torch.Tensor:
         """Label smoothing symétrique : 1 → (1 − ε), 0 → ε/2."""
@@ -61,8 +58,6 @@ class BCE(nn.Module):
                 f"Shape mismatch : predictions={tuple(predictions.shape)}, "
                 f"labels={tuple(labels.shape)}"
             )
-
-    # ─────────────────────────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -83,14 +78,12 @@ class BCE(nn.Module):
 
         is_2d = predictions.dim() == 2
 
-        # Masque sur input 2D : cas impossible, on prévient plutôt que d'ignorer en silence
         if masks is not None and is_2d:
             raise ValueError(
                 "Les masques (masks) ne sont supportés qu'avec des inputs 3D (batch, seq_len, C). "
                 "Pour un input 2D (batch, C), passez masks=None."
             )
 
-        # ── Cas 2D ou sans masque ────────────────────────────────────────────
         if is_2d or masks is None:
             return F.binary_cross_entropy_with_logits(
                 predictions,
@@ -99,7 +92,6 @@ class BCE(nn.Module):
                 reduction=self.reduction,
             )
 
-        # ── Cas 3D avec masque ───────────────────────────────────────────────
         valid_mask = masks.unsqueeze(-1).expand_as(predictions).bool()
 
         loss = F.binary_cross_entropy_with_logits(
@@ -117,8 +109,6 @@ class BCE(nn.Module):
         out = torch.zeros_like(predictions)
         out[valid_mask] = loss
         return out
-
-    # ─────────────────────────────────────────────────────────────────────────
 
     def compute_class_losses(
         self,

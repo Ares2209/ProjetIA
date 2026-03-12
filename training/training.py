@@ -1,4 +1,4 @@
-"""Module pour la logique d'entraînement."""
+"""Module pour la logique d'entraînement — version corrigée."""
 
 import torch
 import torch.nn as nn
@@ -9,6 +9,7 @@ from tqdm import tqdm
 import numpy as np
 from typing import Dict, Optional, Any
 from dataclasses import dataclass, field
+from sklearn.metrics import matthews_corrcoef
 import time
 
 from .metrique import MetricsCalculator, MetricsAccumulator
@@ -17,7 +18,6 @@ from .checkpoint import CheckpointManager
 from .config import Config
 
 # Seuil pour considérer que le MCC est "proche" du meilleur
-# Si le MCC actuel est dans cette marge, on vérifie aussi le composite score
 MCC_CLOSE_THRESHOLD = 0.02
 
 
@@ -30,6 +30,8 @@ class TrainingState:
     best_val_f1: float = 0.0
     best_val_loss: float = float('inf')
     patience_counter: int = 0
+    # CORRECTION 1 : seuil optimal appris pendant l'entraînement
+    best_threshold: float = 0.5
     history: Dict[str, Any] = field(default_factory=lambda: {
         'train_loss': [], 'val_loss': [], 'iteration_losses': [],
         'train_accuracy': [], 'val_accuracy': [],
@@ -55,7 +57,6 @@ class TrainingState:
         'train_fp': [], 'val_fp': [],
         'train_tn': [], 'val_tn': [],
         'train_fn': [], 'val_fn': [],
-        # Métriques composites
         'train_composite_score': [], 'val_composite_score': [],
         'train_g_mean': [], 'val_g_mean': [],
         'val_min_class_recall': [],
@@ -63,11 +64,12 @@ class TrainingState:
         'val_stability_score': [],
         'val_production_score': [],
         'val_f_harmonic': [],
+        # CORRECTION 1 : suivi du seuil optimal par epoch
+        'val_best_threshold': [],
+        'val_mcc_at_best_threshold': [],
     })
 
     def __getattr__(self, name: str):
-        """Accès transparent aux listes de l'historique via attributs."""
-        # Évite la récursion infinie lors de l'init
         if name == 'history':
             raise AttributeError(name)
         history = object.__getattribute__(self, 'history')
@@ -76,7 +78,6 @@ class TrainingState:
         raise AttributeError(f"'TrainingState' has no attribute '{name}'")
 
     def append_epoch(self, prefix: str, metrics: Dict[str, float]) -> None:
-        """Ajoute les métriques d'une epoch à l'historique pour un préfixe donné (train/val)."""
         mapping = {
             'loss': f'{prefix}_loss',
             'accuracy': f'{prefix}_accuracy',
@@ -109,15 +110,15 @@ class TrainingState:
             if src_key in metrics and hist_key in self.history:
                 self.history[hist_key].append(metrics[src_key])
 
-        # Métriques val-only
         if prefix == 'val':
             for key in ('min_class_recall', 'class_balance_gap', 'stability_score',
-                        'production_score', 'f_harmonic'):
+                        'production_score', 'f_harmonic',
+                        # CORRECTION 1 : ajout des nouvelles clés de seuil
+                        'best_threshold', 'mcc_at_best_threshold'):
                 if key in metrics:
                     self.history[f'val_{key}'].append(metrics[key])
 
     def get_history(self) -> Dict[str, Any]:
-        """Retourne une shallow copy de l'historique."""
         return {k: list(v) if isinstance(v, list) else v for k, v in self.history.items()}
 
 
@@ -190,7 +191,25 @@ class Trainer:
         )
 
     def _setup_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
-        total_steps = len(self.train_loader) * self.config.training.num_epochs
+        """
+        CORRECTION 3 : OneCycleLR dimensionné sur un horizon réaliste.
+
+        Problème original : total_steps = len(loader) * num_epochs (500)
+        → avec early stopping à ~120 epochs, le scheduler n'a parcouru que
+          24% de son cycle. La phase de descente finale (qui booste souvent
+          le MCC de 0.005-0.01) n'est jamais atteinte.
+
+        Solution : on estime l'horizon sur patience * 2 (borne réaliste),
+        avec un minimum de 50 epochs pour éviter un cycle trop court.
+        Cela garantit que le cycle LR est adapté à la durée réelle d'entraînement.
+        """
+        patience = self.config.training.patience
+        realistic_epochs = max(50, patience * 2)
+        total_steps = len(self.train_loader) * realistic_epochs
+
+        print(f"   • OneCycleLR dimensionné sur {realistic_epochs} epochs "
+              f"({total_steps} steps) — patience={patience}")
+
         return OneCycleLR(
             self.optimizer,
             max_lr=self.config.training.learning_rate,
@@ -198,6 +217,9 @@ class Trainer:
             pct_start=self.config.training.scheduler_pct_start,
             div_factor=self.config.training.scheduler_div_factor,
             final_div_factor=self.config.training.scheduler_final_div_factor,
+            # CORRECTION 3b : ne pas lever d'erreur si on dépasse total_steps
+            # (cas où early stopping est désactivé)
+            last_epoch=-1,
         )
 
     def _load_pretrained(self, checkpoint_path: str):
@@ -214,16 +236,54 @@ class Trainer:
         self.state.epoch = checkpoint.get('epoch', 0)
         self.state.global_step = checkpoint.get('global_step', 0)
         self.state.best_val_f1 = checkpoint.get('best_val_f1', 0.0)
-        print(f" Checkpoint chargé (epoch {self.state.epoch}, best F1: {self.state.best_val_f1:.4f})")
+        # CORRECTION 1 : restaurer le seuil optimal sauvegardé
+        self.state.best_threshold = checkpoint.get('best_threshold', 0.5)
+        print(f" Checkpoint chargé (epoch {self.state.epoch}, "
+              f"best F1: {self.state.best_val_f1:.4f}, "
+              f"threshold: {self.state.best_threshold:.2f})")
+
+    # =========================================================================
+    # CORRECTION 1 : OPTIMISATION DU SEUIL
+    # =========================================================================
+
+    def _find_optimal_threshold(
+        self,
+        all_probs: np.ndarray,
+        all_labels: np.ndarray,
+        n_steps: int = 81,
+    ) -> tuple[float, float]:
+        """
+        Trouve le seuil qui maximise le MCC sur le set de validation.
+
+        Pourquoi c'est important :
+            Le MCC est sensible au seuil. Avec des classes déséquilibrées
+            ou un modèle légèrement biaisé, le seuil optimal peut être
+            très différent de 0.5. Un seuil à 0.45 vs 0.5 peut représenter
+            +0.01 à +0.03 de MCC sans aucun ré-entraînement.
+
+        Args:
+            all_probs  : probabilités de la classe 1, shape (N,)
+            all_labels : labels vrais (0 ou 1), shape (N,)
+            n_steps    : nombre de seuils testés dans [0.1, 0.9]
+
+        Returns:
+            (best_threshold, best_mcc)
+        """
+        thresholds = np.linspace(0.1, 0.9, n_steps)
+        mccs = []
+        for t in thresholds:
+            preds = (all_probs >= t).astype(int)
+            # matthews_corrcoef retourne 0 si une classe est absente → safe
+            mccs.append(matthews_corrcoef(all_labels, preds))
+
+        best_idx = int(np.argmax(mccs))
+        return float(thresholds[best_idx]), float(mccs[best_idx])
 
     # =========================================================================
     # MÉTRIQUES — méthodes factorisées
     # =========================================================================
 
     def _compute_composite_metrics(self, epoch_metrics) -> Dict[str, float]:
-        """Calcule toutes les métriques composites à partir d'un objet epoch_metrics.
-        Factorisé pour éviter la duplication entre train_epoch() et validate().
-        """
         g_mean = np.sqrt(max(epoch_metrics.recall * epoch_metrics.specificity, 0.0))
         min_class_recall = min(epoch_metrics.class_0_recall, epoch_metrics.class_1_recall)
         class_balance_gap = abs(epoch_metrics.class_0_recall - epoch_metrics.class_1_recall)
@@ -265,9 +325,6 @@ class Trainer:
         }
 
     def _build_epoch_metrics(self, avg_loss: float, epoch_metrics, composite: Dict) -> Dict[str, float]:
-        """Construit le dictionnaire complet de métriques pour une epoch.
-        Factorisé pour éviter la duplication entre train_epoch() et validate().
-        """
         return {
             'loss': avg_loss,
             'accuracy': epoch_metrics.accuracy,
@@ -301,7 +358,6 @@ class Trainer:
     # =========================================================================
 
     def _unpack_batch(self, batch):
-        """Dépaquète un batch selon son format (avec ou sans ids)."""
         if len(batch) == 4:
             spectra, auxiliary, labels, _ = batch
         else:
@@ -319,6 +375,11 @@ class Trainer:
         metrics_accum = MetricsAccumulator(threshold=self.config.training.classification_threshold)
         log_every = max(1, len(self.train_loader) // 10)
 
+        # CORRECTION 4 : accumulateurs pour métriques pbar sur fenêtre glissante
+        # (évite le bruit des métriques calculées sur un seul batch)
+        window_preds, window_labels = [], []
+        window_size = 5  # moyenne glissante sur 5 batches
+
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.state.epoch + 1}", leave=False)
         for batch_idx, batch in enumerate(pbar):
             spectra, auxiliary, labels = self._unpack_batch(batch)
@@ -327,9 +388,13 @@ class Trainer:
             predictions = self.model(spectra, auxiliary)
             loss = self.criterion(predictions, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.training.max_grad_norm
+            )
             self.optimizer.step()
-            if self.scheduler:
+
+            # CORRECTION 3b : step le scheduler uniquement si on n'a pas dépassé total_steps
+            if self.scheduler and self.state.global_step < self.scheduler.total_steps:
                 self.scheduler.step()
 
             batch_loss = loss.item()
@@ -338,23 +403,35 @@ class Trainer:
 
             with torch.no_grad():
                 class_idx = min(1, predictions.shape[1] - 1)
-                preds_cls = predictions[:, class_idx]
+                preds_cls  = predictions[:, class_idx]
                 labels_cls = labels[:, class_idx]
                 metrics_accum.update(preds_cls, labels_cls, store_for_probabilistic=True)
-                current_metrics = self.metrics_calculator.compute_metrics(preds_cls, labels_cls)
+
+                # CORRECTION 4 : fenêtre glissante pour la pbar
+                window_preds.append(preds_cls.cpu())
+                window_labels.append(labels_cls.cpu())
+                if len(window_preds) > window_size:
+                    window_preds.pop(0)
+                    window_labels.pop(0)
+
+                w_preds  = torch.cat(window_preds)
+                w_labels = torch.cat(window_labels)
+                smoothed = self.metrics_calculator.compute_metrics(w_preds, w_labels)
 
             if (batch_idx + 1) % log_every == 0:
                 self.writer.add_scalar('Train/Loss_iter', batch_loss, self.state.global_step)
                 self.writer.add_scalar('Train/LR', self._get_lr(), self.state.global_step)
-                self.writer.add_scalar('Train/MCC_iter', current_metrics.mcc, self.state.global_step)
-                self.writer.add_scalar('Train/BalancedAcc_iter', current_metrics.balanced_accuracy, self.state.global_step)
+                self.writer.add_scalar('Train/MCC_iter', smoothed.mcc, self.state.global_step)
+                self.writer.add_scalar(
+                    'Train/BalancedAcc_iter', smoothed.balanced_accuracy, self.state.global_step
+                )
 
             self.state.global_step += 1
             pbar.set_postfix({
                 'loss': f'{batch_loss:.4f}',
-                'mcc': f'{current_metrics.mcc:.4f}',
-                'bal_acc': f'{current_metrics.balanced_accuracy:.4f}',
-                'f1': f'{current_metrics.f1:.4f}',
+                'mcc': f'{smoothed.mcc:.4f}',      # lissé sur 5 batches
+                'bal_acc': f'{smoothed.balanced_accuracy:.4f}',
+                'f1': f'{smoothed.f1:.4f}',
                 'lr': f'{self._get_lr():.2e}',
             })
 
@@ -364,10 +441,19 @@ class Trainer:
         return self._build_epoch_metrics(avg_loss, epoch_metrics, composite)
 
     def validate(self) -> Dict[str, float]:
-        """Évalue le modèle sur le set de validation."""
+        """
+        Évalue le modèle sur le set de validation.
+
+        CORRECTION 1 : collecte toutes les probabilités pour trouver
+        le seuil optimal via _find_optimal_threshold().
+        """
         self.model.eval()
         total_loss = 0.0
         metrics_accum = MetricsAccumulator(threshold=self.config.training.classification_threshold)
+
+        # CORRECTION 1 : accumulateurs pour l'optimisation du seuil
+        all_probs_list  = []
+        all_labels_list = []
 
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validation", leave=False):
@@ -375,41 +461,49 @@ class Trainer:
                 predictions = self.model(spectra, auxiliary)
                 loss = self.criterion(predictions, labels)
                 total_loss += loss.item()
-                class_idx = min(1, predictions.shape[1] - 1)
-                metrics_accum.update(
-                    predictions[:, class_idx],
-                    labels[:, class_idx],
-                    store_for_probabilistic=True,
-                )
 
-        avg_loss = total_loss / len(self.val_loader)
+                class_idx = min(1, predictions.shape[1] - 1)
+                preds_cls  = predictions[:, class_idx]
+                labels_cls = labels[:, class_idx]
+
+                metrics_accum.update(preds_cls, labels_cls, store_for_probabilistic=True)
+
+                # Collecte pour optimisation du seuil
+                probs = torch.sigmoid(preds_cls).cpu().numpy()
+                lbls  = labels_cls.cpu().numpy()
+                # Gestion du cas one-hot vs scalaire
+                if lbls.ndim > 1:
+                    lbls = lbls[:, 0] if lbls.shape[1] == 1 else lbls.argmax(axis=1)
+                all_probs_list.append(probs.flatten())
+                all_labels_list.append(lbls.flatten())
+
+        avg_loss     = total_loss / len(self.val_loader)
         epoch_metrics = metrics_accum.compute(compute_probabilistic=True)
-        composite = self._compute_composite_metrics(epoch_metrics)
-        return self._build_epoch_metrics(avg_loss, epoch_metrics, composite)
+        composite    = self._compute_composite_metrics(epoch_metrics)
+        metrics      = self._build_epoch_metrics(avg_loss, epoch_metrics, composite)
+
+        # CORRECTION 1 : optimisation du seuil
+        all_probs  = np.concatenate(all_probs_list)
+        all_labels = np.concatenate(all_labels_list)
+        best_t, mcc_at_best_t = self._find_optimal_threshold(all_probs, all_labels)
+        metrics['best_threshold']        = best_t
+        metrics['mcc_at_best_threshold'] = mcc_at_best_t
+
+        # Mise à jour du seuil global si le MCC avec ce seuil est meilleur
+        if mcc_at_best_t > self.state.best_val_mcc:
+            self.state.best_threshold = best_t
+
+        return metrics
 
     # =========================================================================
     # FEATURE STATS
     # =========================================================================
 
     def _compute_feature_stats(self) -> Dict[str, list]:
-        """Calcule mean/std des features sur le train set via l'algorithme de Chan.
-
-        Avantages par rapport à la méthode sum/sumsq :
-          - Stable numériquement : pas de soustraction de deux grands nombres
-            (évite la perte de précision sur les grands datasets)
-          - Accumulation directe en torch.float64 sur CPU → pas de conversion
-            numpy par batch, une seule à la fin via .tolist()
-
-        Algorithme de Chan (réduction parallèle en un seul passage) :
-            new_n    = n_a + n_b
-            delta    = mean_b - mean_a
-            new_mean = (n_a * mean_a + n_b * mean_b) / new_n
-            new_M2   = M2_a + M2_b + delta² * n_a * n_b / new_n
-            std      = sqrt(new_M2 / new_n)          ← variance de population
-        """
+        """Calcule mean/std des features sur le train set via l'algorithme de Chan."""
         total_n: int = 0
         mean: Optional[torch.Tensor] = None
-        M2:   Optional[torch.Tensor] = None   # somme des carrés des écarts (Welford)
+        M2:   Optional[torch.Tensor] = None
 
         with torch.no_grad():
             for batch in tqdm(self.train_loader, desc="Computing feature stats", leave=False):
@@ -418,18 +512,16 @@ class Trainer:
                 else:
                     spectra, auxiliary, _ = batch
 
-                # Tout en float64 sur CPU pour la précision numérique
-                spectra_flat = spectra.reshape(spectra.shape[0], -1).cpu().double()  # (B, C*L)
-                features     = torch.cat([spectra_flat, auxiliary.cpu().double()], dim=1)  # (B, D)
+                spectra_flat = spectra.reshape(spectra.shape[0], -1).cpu().double()
+                features     = torch.cat([spectra_flat, auxiliary.cpu().double()], dim=1)
 
                 b_n    = features.shape[0]
-                b_mean = features.mean(dim=0)                        # (D,)
-                b_M2   = ((features - b_mean) ** 2).sum(dim=0)      # (D,)
+                b_mean = features.mean(dim=0)
+                b_M2   = ((features - b_mean) ** 2).sum(dim=0)
 
                 if mean is None:
                     total_n, mean, M2 = b_n, b_mean, b_M2
                 else:
-                    # Fusion des deux groupes (algorithme de Chan)
                     new_n   = total_n + b_n
                     delta   = b_mean - mean
                     mean    = (total_n * mean + b_n * b_mean) / new_n
@@ -437,7 +529,7 @@ class Trainer:
                     total_n = new_n
 
         if total_n == 0:
-            raise RuntimeError("No valid samples found in train_loader to compute feature stats")
+            raise RuntimeError("No valid samples found in train_loader")
 
         std = torch.sqrt(torch.clamp(M2 / total_n, min=1e-8))
         return {'mean': mean.tolist(), 'std': std.tolist()}
@@ -447,11 +539,9 @@ class Trainer:
     # =========================================================================
 
     def _build_checkpoint_history(self) -> Dict:
-        """Construit le dictionnaire d'historique complet pour les checkpoints."""
         return self.state.get_history()
 
     def _save_checkpoint(self, is_best: bool):
-        """Sauvegarde un checkpoint."""
         self.checkpoint_manager.save_checkpoint(
             model=self.model,
             optimizer=self.optimizer,
@@ -460,6 +550,8 @@ class Trainer:
             global_step=self.state.global_step,
             best_val_mcc=self.state.best_val_mcc,
             best_val_f1=self.state.best_val_f1,
+            # CORRECTION 1 : sauvegarder le seuil optimal avec le modèle
+            best_threshold=self.state.best_threshold,
             history=self._build_checkpoint_history(),
             feature_stats=self.feature_stats,
             config=self.config.to_dict(),
@@ -474,12 +566,14 @@ class Trainer:
         """Boucle d'entraînement complète."""
         start_time = time.time()
         num_epochs = self.config.training.num_epochs
-        patience = self.config.training.patience
-        min_delta = self.config.training.min_delta
+        patience   = self.config.training.patience
+        min_delta  = self.config.training.min_delta
         save_every = self.config.training.save_every_n_epochs
 
         best_metrics = {
             'mcc': -1.0,
+            'mcc_at_best_threshold': -1.0,   # CORRECTION 1
+            'best_threshold': 0.5,            # CORRECTION 1
             'composite_score': -float('inf'),
             'g_mean': 0.0,
             'stability_score': -1.0,
@@ -493,7 +587,7 @@ class Trainer:
         print(f"{'='*90}")
         print(f"  Epochs:              {num_epochs}")
         print(f"  Patience:            {patience}  |  Min Delta: {min_delta}")
-        print(f"  MCC Close Threshold: {MCC_CLOSE_THRESHOLD} (composite score vérifié dans cette marge)")
+        print(f"  MCC Close Threshold: {MCC_CLOSE_THRESHOLD}")
         print(f"  Device:              {self.device}")
         print(f"  Batch Size:          {self.config.training.batch_size}")
         print(f"  Learning Rate:       {self.config.training.learning_rate}")
@@ -504,54 +598,49 @@ class Trainer:
         print(f"  Train Batches:       {len(self.train_loader)}  |  Val Batches: {len(self.val_loader)}")
         print(f"{'='*90}\n")
 
-        epoch = -1  # Protège les blocs except si la boucle ne démarre pas
+        epoch = -1
         try:
             for epoch in range(num_epochs):
                 self.state.epoch = epoch
                 epoch_start = time.time()
 
                 train_metrics = self.train_epoch()
-                val_metrics = self.validate()
+                val_metrics   = self.validate()
 
-                # ── Historique ──────────────────────────────────────────────
                 self.state.append_epoch('train', train_metrics)
                 self.state.append_epoch('val', val_metrics)
-
-                # ── TensorBoard ─────────────────────────────────────────────
                 self._log_tensorboard(epoch, train_metrics, val_metrics)
-
-                # ── Affichage console ────────────────────────────────────────
                 self._log_console(epoch, num_epochs, time.time() - epoch_start,
                                   train_metrics, val_metrics, best_metrics, patience)
 
-                # ── Critère d'amélioration ───────────────────────────────────
-                mcc_improvement = val_metrics['mcc'] - best_metrics['mcc']
-                composite_improvement = val_metrics['composite_score'] - best_metrics['composite_score']
+                # CORRECTION 2 : critère d'amélioration basé sur mcc_at_best_threshold
+                # plutôt que le MCC au seuil fixe 0.5.
+                # On compare le MCC optimal (seuil libre) avec le meilleur connu.
+                mcc_at_t         = val_metrics['mcc_at_best_threshold']
+                mcc_improvement  = mcc_at_t - best_metrics['mcc_at_best_threshold']
+                comp_improvement = (val_metrics['composite_score']
+                                    - best_metrics['composite_score'])
 
-                # Amélioration si :
-                #   (a) MCC progresse clairement au-delà de min_delta, OU
-                #   (b) MCC est très proche du meilleur ET le composite score progresse
-                mcc_close = abs(mcc_improvement) <= MCC_CLOSE_THRESHOLD
+                mcc_close   = abs(mcc_improvement) <= MCC_CLOSE_THRESHOLD
                 is_improved = (
                     mcc_improvement > min_delta
-                    or (mcc_close and composite_improvement > min_delta)
+                    or (mcc_close and comp_improvement > min_delta)
                 )
                 improvement_reason = (
-                    "MCC" if mcc_improvement > min_delta
+                    "MCC@optimal_threshold" if mcc_improvement > min_delta
                     else "Composite Score (MCC proche du meilleur)" if is_improved
                     else None
                 )
 
                 if is_improved:
                     self._on_improvement(val_metrics, train_metrics, best_metrics,
-                                         mcc_improvement, composite_improvement,
+                                         mcc_improvement, comp_improvement,
                                          improvement_reason)
                 else:
                     self.state.patience_counter += 1
                     self._log_no_improvement(val_metrics, best_metrics, mcc_improvement,
-                                              composite_improvement, min_delta, patience)
+                                              comp_improvement, min_delta, patience)
 
-                # ── Sauvegarde epoch 0 si pas d'amélioration ────────────────
                 if epoch == 0 and not is_improved:
                     try:
                         self._save_checkpoint(is_best=False)
@@ -559,7 +648,6 @@ class Trainer:
                     except Exception as e:
                         print(f"  Erreur sauvegarde checkpoint initial: {e}\n")
 
-                # ── Sauvegarde périodique ────────────────────────────────────
                 if (epoch + 1) % save_every == 0:
                     try:
                         self._save_checkpoint(is_best=False)
@@ -567,12 +655,10 @@ class Trainer:
                     except Exception as e:
                         print(f"⚠️  Erreur sauvegarde checkpoint périodique: {e}\n")
 
-                # ── Early stopping ───────────────────────────────────────────
                 if self.state.patience_counter >= patience:
                     self._log_early_stopping(epoch, patience, best_metrics)
                     break
 
-            # ── Résumé final ─────────────────────────────────────────────────
             elapsed_time = time.time() - start_time
             self._log_final_summary(epoch, num_epochs, elapsed_time, patience, best_metrics)
             self.writer.close()
@@ -584,6 +670,8 @@ class Trainer:
                 'training_time': elapsed_time,
                 'early_stopped': self.state.patience_counter >= patience,
                 'history': self.state.get_history(),
+                # CORRECTION 1 : exposer le seuil optimal dans le résultat final
+                'best_threshold': self.state.best_threshold,
             }
 
         except KeyboardInterrupt:
@@ -605,31 +693,37 @@ class Trainer:
 
     def _on_improvement(self, val_metrics, train_metrics, best_metrics,
                         mcc_improvement, composite_improvement, reason):
-        """Appelé quand une amélioration est détectée."""
         best_metrics.update({
-            'composite_score': val_metrics['composite_score'],
-            'mcc': val_metrics['mcc'],
-            'g_mean': val_metrics['g_mean'],
-            'stability_score': val_metrics['stability_score'],
-            'production_score': val_metrics['production_score'],
-            'f_harmonic': val_metrics['f_harmonic'],
+            'composite_score':        val_metrics['composite_score'],
+            'mcc':                    val_metrics['mcc'],
+            'mcc_at_best_threshold':  val_metrics['mcc_at_best_threshold'],  # CORRECTION 1
+            'best_threshold':         val_metrics['best_threshold'],          # CORRECTION 1
+            'g_mean':                 val_metrics['g_mean'],
+            'stability_score':        val_metrics['stability_score'],
+            'production_score':       val_metrics['production_score'],
+            'f_harmonic':             val_metrics['f_harmonic'],
         })
         if val_metrics['auroc'] > 0:
             best_metrics['auroc'] = val_metrics['auroc']
 
-        self.state.best_val_mcc = val_metrics['mcc']
-        self.state.best_val_f1 = val_metrics['f1']
+        self.state.best_val_mcc  = val_metrics['mcc']
+        self.state.best_val_f1   = val_metrics['f1']
+        self.state.best_threshold = val_metrics['best_threshold']  # CORRECTION 1
         self.state.patience_counter = 0
 
         print(f"\n{'='*90}")
         print(f" AMÉLIORATION DÉTECTÉE! ({reason})")
         print(f"{'='*90}")
-        print(f"  MCC:              {val_metrics['mcc']:.4f}  (Δ {mcc_improvement:+.4f})")
-        print(f"  Composite Score:  {val_metrics['composite_score']:.4f}  (Δ {composite_improvement:+.4f})")
-        print(f"  G-Mean:           {val_metrics['g_mean']:.4f}")
-        print(f"  Stability Score:  {val_metrics['stability_score']:.4f}")
-        print(f"  Production Score: {val_metrics['production_score']:.4f}")
-        print(f"  F-Harmonic:       {val_metrics['f_harmonic']:.4f}")
+        print(f"  MCC (seuil 0.5):       {val_metrics['mcc']:.4f}  (Δ {mcc_improvement:+.4f})")
+        # CORRECTION 1 : affiche le MCC au seuil optimal
+        print(f"  MCC (seuil optimal):   {val_metrics['mcc_at_best_threshold']:.4f}  "
+              f"@ threshold={val_metrics['best_threshold']:.2f}")
+        print(f"  Composite Score:       {val_metrics['composite_score']:.4f}  "
+              f"(Δ {composite_improvement:+.4f})")
+        print(f"  G-Mean:                {val_metrics['g_mean']:.4f}")
+        print(f"  Stability Score:       {val_metrics['stability_score']:.4f}")
+        print(f"  Production Score:      {val_metrics['production_score']:.4f}")
+        print(f"  F-Harmonic:            {val_metrics['f_harmonic']:.4f}")
 
         min_recall_threshold = 0.50
         ok = val_metrics['min_class_recall'] >= min_recall_threshold
@@ -639,7 +733,7 @@ class Trainer:
 
         try:
             self._save_checkpoint(is_best=True)
-            print(f"\n💾 Meilleur modèle sauvegardé!")
+            print(f"\n💾 Meilleur modèle sauvegardé! (threshold={self.state.best_threshold:.2f})")
             print(f"{'='*90}\n")
         except Exception as e:
             print(f"\n❌ Erreur lors de la sauvegarde: {e}")
@@ -672,6 +766,11 @@ class Trainer:
             if v:
                 self.writer.add_scalar(f'Val/{key.title()}', v, epoch)
 
+        # CORRECTION 1 : log du seuil optimal et du MCC associé
+        self.writer.add_scalar('Val/Optimal_Threshold', val.get('best_threshold', 0.5), epoch)
+        self.writer.add_scalar('Val/MCC_At_Optimal_Threshold',
+                               val.get('mcc_at_best_threshold', 0.0), epoch)
+
         self.writer.add_scalar('Learning_Rate', self._get_lr(), epoch)
 
     def _log_console(self, epoch, num_epochs, epoch_time, train, val, best, patience):
@@ -688,6 +787,12 @@ class Trainer:
                           ("Cohen's Kappa", "cohen_kappa")]:
             row(lbl, key)
 
+        # CORRECTION 1 : affichage du MCC au seuil optimal
+        print(f"  {'MCC (seuil optimal)':<22}              "
+              f"Val: {val.get('mcc_at_best_threshold', 0):.4f}  "
+              f"@ t={val.get('best_threshold', 0.5):.2f}  "
+              f"(best: {best.get('mcc_at_best_threshold', 0):.4f})")
+
         print(f"\n F-SCORES & IoU / PRECISION-RECALL:")
         for lbl, key in [("F1", "f1"), ("F2", "f2"), ("IoU", "iou"),
                           ("Precision", "precision"), ("Recall", "recall"),
@@ -703,15 +808,19 @@ class Trainer:
         print(f"\n ÉQUILIBRE ENTRE CLASSES (Val):")
         print(f"  Min Class Recall:      {val['min_class_recall']:.4f}")
         print(f"  Class Balance Gap:     {val['class_balance_gap']:.4f} (↓ = mieux)")
-        print(f"  Classe 0 — Precision:  {val['class_0_precision']:.4f}  Recall: {val['class_0_recall']:.4f}")
-        print(f"  Classe 1 — Precision:  {val['class_1_precision']:.4f}  Recall: {val['class_1_recall']:.4f}")
+        print(f"  Classe 0 — Precision:  {val['class_0_precision']:.4f}  "
+              f"Recall: {val['class_0_recall']:.4f}")
+        print(f"  Classe 1 — Precision:  {val['class_1_precision']:.4f}  "
+              f"Recall: {val['class_1_recall']:.4f}")
 
         if val['auroc'] > 0:
             print(f"\n MÉTRIQUES PROBABILISTES:")
-            for lbl, key in [("AUROC", "auroc"), ("AUPRC", "auprc"), ("Brier Score", "brier_score")]:
+            for lbl, key in [("AUROC", "auroc"), ("AUPRC", "auprc"),
+                              ("Brier Score", "brier_score")]:
                 row(lbl, key)
-            if val['probabilistic_score'] > 0:
-                print(f"  {'Probabilistic Sc':<22}       Val: {val['probabilistic_score']:.4f}")
+            if val.get('probabilistic_score', 0) > 0:
+                print(f"  {'Probabilistic Sc':<22}       "
+                      f"Val: {val['probabilistic_score']:.4f}")
 
         print(f"\n SUPPORT / HYPERPARAMÈTRES:")
         print(f"  Classe 0:  Train {train['support_class_0']} | Val {val['support_class_0']}")
@@ -722,27 +831,32 @@ class Trainer:
         print(f"\n{'='*90}")
         print(f" PATIENCE: {self.state.patience_counter}/{patience}")
         print(f"{'='*90}")
-        print(f"  MCC:              {val['mcc']:.4f} (best: {best['mcc']:.4f}, Δ {mcc_imp:+.4f})")
-        print(f"  Composite Score:  {val['composite_score']:.4f} (best: {best['composite_score']:.4f}, Δ {comp_imp:+.4f})")
-        print(f"  Amélioration requise: > {min_delta:.4f} sur MCC ou Composite (si MCC dans ±{MCC_CLOSE_THRESHOLD})")
+        print(f"  MCC@optimal:      {val['mcc_at_best_threshold']:.4f}  "
+              f"(best: {best['mcc_at_best_threshold']:.4f}, Δ {mcc_imp:+.4f})")
+        print(f"  Composite Score:  {val['composite_score']:.4f}  "
+              f"(best: {best['composite_score']:.4f}, Δ {comp_imp:+.4f})")
+        print(f"  Amélioration requise: > {min_delta:.4f}")
         print(f"  G-Mean:           {val['g_mean']:.4f} (best: {best['g_mean']:.4f})")
-        print(f"  Stability Score:  {val['stability_score']:.4f} (best: {best['stability_score']:.4f})")
-        print(f"  Production Score: {val['production_score']:.4f} (best: {best['production_score']:.4f})")
+        print(f"  Stability Score:  {val['stability_score']:.4f} "
+              f"(best: {best['stability_score']:.4f})")
         print(f"{'='*90}\n")
 
     def _log_early_stopping(self, epoch, patience, best):
         print(f"\n{'='*90}")
         print(f"  EARLY STOPPING — patience épuisée ({patience} epochs)")
         print(f"  Meilleur epoch estimé: {epoch + 1 - patience}")
-        print(f"  MCC: {best['mcc']:.4f}  |  Composite: {best['composite_score']:.4f}")
-        print(f"  G-Mean: {best['g_mean']:.4f}  |  F-Harmonic: {best['f_harmonic']:.4f}")
+        print(f"  MCC: {best['mcc']:.4f}  →  MCC@optimal: {best['mcc_at_best_threshold']:.4f}  "
+              f"(threshold={best['best_threshold']:.2f})")
+        print(f"  Composite: {best['composite_score']:.4f}  |  G-Mean: {best['g_mean']:.4f}")
+        print(f"  F-Harmonic: {best['f_harmonic']:.4f}")
         if best['auroc'] > 0:
             print(f"  AUROC: {best['auroc']:.4f}")
         print(f"{'='*90}\n")
 
     def _log_final_summary(self, epoch, num_epochs, elapsed, patience, best):
         hist = self.state.history
-        best_idx = int(np.argmax(hist['val_composite_score'])) if hist['val_composite_score'] else 0
+        best_idx = (int(np.argmax(hist['val_composite_score']))
+                    if hist['val_composite_score'] else 0)
 
         print(f"\n{'='*90}")
         print(f" ENTRAÎNEMENT TERMINÉ — {self._format_time(elapsed)}")
@@ -750,10 +864,15 @@ class Trainer:
         print(f"  Early stopping: {'Oui' if self.state.patience_counter >= patience else 'Non'}")
         print(f"\n MEILLEURS RÉSULTATS (Epoch {best_idx + 1}):")
         print(f"  Composite: {best['composite_score']:.4f}  |  MCC: {best['mcc']:.4f}")
+        # CORRECTION 1 : affiche le MCC final au seuil optimal
+        print(f"  MCC@optimal:  {best['mcc_at_best_threshold']:.4f}  "
+              f"(threshold={best['best_threshold']:.2f})")
         print(f"  G-Mean: {best['g_mean']:.4f}  |  F-Harmonic: {best['f_harmonic']:.4f}")
-        print(f"  Stability: {best['stability_score']:.4f}  |  Production: {best['production_score']:.4f}")
+        print(f"  Stability: {best['stability_score']:.4f}  |  "
+              f"Production: {best['production_score']:.4f}")
         if hist.get('val_f1'):
-            print(f"  F1: {hist['val_f1'][best_idx]:.4f}  |  Balanced Acc: {hist['val_balanced_accuracy'][best_idx]:.4f}")
+            print(f"  F1: {hist['val_f1'][best_idx]:.4f}  |  "
+                  f"Balanced Acc: {hist['val_balanced_accuracy'][best_idx]:.4f}")
         if best['auroc'] > 0:
             print(f"  AUROC: {best['auroc']:.4f}")
         print(f"{'='*90}\n")

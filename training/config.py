@@ -9,8 +9,9 @@ import torch
 @dataclass
 class ModelConfig:
     """Configuration du modèle CNN."""
-    # Architecture choice: 'CNN' or 'ResNet'
-    architecture: str = 'ResNet'
+    
+    # Architecture
+    architecture: str = 'LightGBM'
     
     # Pour CNN simple
     conv_channels: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
@@ -19,16 +20,24 @@ class ModelConfig:
     fc_dims: List[int] = field(default_factory=lambda: [256, 128])
     
     # Pour ResNetSpectralCNN
-    d_model: int = 32  # initial_channels pour ResNet
-    num_layers: int = 1  # num_blocks par layer
+    spectrum_length: int = 283
+    input_channels: int = 3  # mean + 2 incertitudes
     
+    # Pour LightGBM
+    spectrum_length:int = 283
+    use_pca:bool = False
+    pca_components:int = 50
+    use_statistical_features:bool = True
+    use_diff_features:bool = False
+
     # Commun
+    auxiliary_dim:int = 5
     dropout: float = 0.3
     use_batch_norm: bool = True
     
     def __post_init__(self):
         """Validation."""
-        if self.architecture not in ['CNN', 'ResNet']:
+        if self.architecture not in ['CNN', 'ResNet','ResNet18', 'ResNet34', 'ResNet8','LightGBM']:
             raise ValueError("architecture must be 'CNN' or 'ResNet'")
         if self.dropout < 0 or self.dropout > 1:
             raise ValueError("dropout must be between 0 and 1")
@@ -227,12 +236,6 @@ class Config:
         
         print("\n  MODÈLE:")
         print(f"  • Architecture: {self.model.architecture.upper()}")
-        if self.model.architecture == 'simple':
-            print(f"  • Conv channels: {self.model.conv_channels}")
-            print(f"  • FC dims: {self.model.fc_dims}")
-        else:
-            print(f"  • Initial channels: {self.model.d_model}")
-            print(f"  • Blocks per layer: {self.model.num_layers}")
         print(f"  • Dropout: {self.model.dropout}")
         
         print("\nENTRAÎNEMENT:")
