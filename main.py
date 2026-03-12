@@ -11,10 +11,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from training.LightGBM import LightGBM
 from training.config import Config, get_config_object
 from training.training import Trainer
-from training.TrainingGBM import LightGBMTrainer
 from training.utils import set_seed
 from models.dataset import ExoplanetDataset, collate_fn
 from sklearn.model_selection import train_test_split
