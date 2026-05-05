@@ -11,7 +11,7 @@ class ModelConfig:
     """Configuration du modèle CNN."""
     
     # Architecture
-    architecture: str = 'LightGBM'
+    architecture: str = '2ResNet'
     
     # Pour CNN simple
     conv_channels: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
@@ -19,26 +19,26 @@ class ModelConfig:
     pool_sizes: List[int] = field(default_factory=lambda: [2, 2, 2, 2])
     fc_dims: List[int] = field(default_factory=lambda: [256, 128])
     
-    # Pour ResNetSpectralCNN
+    # Pour ResNetSpectralCNN / CNN
     spectrum_length: int = 283
-    input_channels: int = 3  # mean + 2 incertitudes
-    
-    # Pour LightGBM
-    spectrum_length:int = 283
-    use_pca:bool = False
-    pca_components:int = 50
-    use_statistical_features:bool = True
-    use_diff_features:bool = False
+    input_channels: int = 5  # mean + 2 incertitudes + SNR + incertitude relative
+
+    # Pour XGBoost / LightGBM
+    use_pca: bool = False
+    pca_components: int = 50
+    use_statistical_features: bool = True
+    use_diff_features: bool = False
 
     # Commun
-    auxiliary_dim:int = 5
+    auxiliary_dim: int = 5
     dropout: float = 0.3
     use_batch_norm: bool = True
-    
+
     def __post_init__(self):
         """Validation."""
-        if self.architecture not in ['CNN', 'ResNet','ResNet18', 'ResNet34', 'ResNet8','LightGBM']:
-            raise ValueError("architecture must be 'CNN' or 'ResNet'")
+        valid_archs = ['CNN', '2ResNet', 'ResNet', 'ResNet18', 'ResNet34', 'ResNet8', 'LightGBM', 'XGBoost']
+        if self.architecture not in valid_archs:
+            raise ValueError(f"architecture must be one of {valid_archs}")
         if self.dropout < 0 or self.dropout > 1:
             raise ValueError("dropout must be between 0 and 1")
 
@@ -58,9 +58,9 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     
     # Scheduler
-    scheduler_pct_start: float = 0.9
-    scheduler_div_factor: float = 1
-    scheduler_final_div_factor: float = 1
+    scheduler_pct_start: float = 0.3
+    scheduler_div_factor: float = 25
+    scheduler_final_div_factor: float = 1e4
 
     # Early stopping
     min_delta: float = 0.001
@@ -72,6 +72,7 @@ class TrainingConfig:
     # Loss
     pos_weight: Optional[List[float]] = None  # [weight_eau, weight_nuages]
     loss_type = ""
+    label_smoothing: float = 0.05
     
     classification_threshold: float = 0.5
     
@@ -89,7 +90,6 @@ class TrainingConfig:
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be > 0")
 
-@dataclass
 @dataclass
 class DataConfig:
     """Configuration des données exoplanètes."""
@@ -114,12 +114,12 @@ class DataConfig:
     normalize_auxiliary: str = 'zscore'  # 'zscore', 'minmax', 'none'
 
     # Augmentation
-    use_augmentation: bool = True
-    augmentation_factor: int = 0          # copies augmentées par échantillon
+    use_augmentation: bool = False
+    augmentation_factor: int = 2          # copies augmentées par échantillon
     shift_range: float = 0.05             # décalage additif max (fraction de la std)
     scale_range: float = 0.10             # mise à l'échelle multiplicative max
     noise_std: float = 0.02               # écart-type du bruit gaussien
-    flip_prob: float = 0.5                # proba de retourner le spectre
+    flip_prob: float = 0                # proba de retourner le spectre
     channel_dropout_prob: float = 0.1     # proba de zeroing d'un canal
 
     # Seed

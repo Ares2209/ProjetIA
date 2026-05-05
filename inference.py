@@ -4,23 +4,23 @@ Charge un checkpoint et évalue sur un ensemble de données complet.
 Génère une matrice de confusion et des métriques de performance.
 
 Usage:
-    python inference.py --checkpoint checkpoints/exoplanet_modelbest.pth
+    python inference.py --checkpoint models/ResNetCNN/checkpoints/resnet_modelbest.pth
 
 Exemple avec targets pour évaluation:
     python inference.py \
-      --checkpoint checkpoints/exoplanet_modelbest.pth \
+      --checkpoint models/ResNetCNN/checkpoints/resnet_modelbest.pth \
       --spectra Défi-IA-2026/DATA/defi-ia-cnes/spectra.npy \
       --auxiliary Défi-IA-2026/DATA/defi-ia-cnes/auxiliary.csv \
       --targets Défi-IA-2026/DATA/defi-ia-cnes/targets.csv \
       --batch-size 64 \
-      --output results/
+      --output models/ResNetCNN/results/
 
 Exemple sans targets (prédictions seulement):
     python inference.py \
-      --checkpoint checkpoints/exoplanet_modelbest.pth \
+      --checkpoint models/ResNetCNN/checkpoints/resnet_modelbest.pth \
       --spectra Défi-IA-2026/DATA/defi-ia-cnes/spectra_test.npy \
       --auxiliary Défi-IA-2026/DATA/defi-ia-cnes/auxiliary_test.csv \
-      --output results/predictions.csv
+      --output models/ResNetCNN/results/predictions.csv
 """
 import argparse
 import json

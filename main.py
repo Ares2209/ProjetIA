@@ -11,14 +11,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from training.config import Config, get_config_object
+from training.config import Config
 from training.training import Trainer
 from training.utils import set_seed
 from models.dataset import ExoplanetDataset, collate_fn
 from sklearn.model_selection import train_test_split
 from models.CNN import CNN
-from models.ResNetCNN import ResNet1D, resnet18_1d, resnet34_1d, resnet8_1d
+from models.ResNetCNN import ResNet1D, resnet18_1d, resnet34_1d, resnet8_1d, ensemble_resnet_1d
 from torch.utils.data import DataLoader
+
+ARCH_TO_CONFIG = {
+    'CNN':       'models.CNN.config',
+    'ResNetCNN': 'models.ResNetCNN.config',
+    'XGBoost':   'models.XGBoost.config',
+}
+
+
+def load_config_for_arch(arch: str) -> Config:
+    """Charge la config presets du modèle depuis models/<arch>/config.py."""
+    import importlib
+    if arch not in ARCH_TO_CONFIG:
+        raise ValueError(f"--arch invalide : '{arch}'. Choix : {list(ARCH_TO_CONFIG)}")
+    return importlib.import_module(ARCH_TO_CONFIG[arch]).get_config()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +140,7 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
     dataset_info = {
         'spectrum_length': train_dataset.spectra.shape[1],
         'auxiliary_dim':   train_dataset.aux_features.shape[1],
+        'input_channels':  train_dataset.spectra.shape[2],
     }
     del spectra_all
     return train_loader, val_loader, dataset_info
@@ -140,7 +155,7 @@ def build_model(cfg, spectrum_length: int, auxiliary_dim: int):
         spectrum_length = spectrum_length,
         auxiliary_dim   = auxiliary_dim,
         num_classes     = cfg.training.num_classes,
-        input_channels  = 3,
+        input_channels  = cfg.model.input_channels,
         dropout         = cfg.model.dropout,
     )
 
@@ -166,32 +181,9 @@ def build_model(cfg, spectrum_length: int, auxiliary_dim: int):
     elif arch == "ResNet34":
         print("  Architecture : ResNet-34 (⚠ risque surapprentissage)")
         return resnet34_1d(**common_torch)
-
-    elif arch == "LightGBM":
-        # ── LightGBM : pas de dropout, pas de batch_norm, paramètres dédiés ──
-        print("  Architecture : LightGBM")
-        return LightGBM(
-            spectrum_length        = spectrum_length,
-            auxiliary_dim          = auxiliary_dim,
-            num_classes            = cfg.training.num_classes,
-            input_channels         = 3,
-            # Hyperparamètres boosting (lus depuis cfg.model s'ils existent)
-            n_estimators           = getattr(cfg.model, 'n_estimators',    500),
-            learning_rate          = getattr(cfg.model, 'lgbm_lr',         0.05),
-            num_leaves             = getattr(cfg.model, 'num_leaves',       63),
-            max_depth              = getattr(cfg.model, 'max_depth',        -1),
-            min_child_samples      = getattr(cfg.model, 'min_child_samples', 20),
-            subsample              = getattr(cfg.model, 'subsample',        0.8),
-            colsample_bytree       = getattr(cfg.model, 'colsample_bytree', 0.8),
-            reg_alpha              = getattr(cfg.model, 'reg_alpha',        0.1),
-            reg_lambda             = getattr(cfg.model, 'reg_lambda',       0.1),
-            # Feature engineering
-            use_pca                = getattr(cfg.model, 'use_pca',               False),
-            pca_components         = getattr(cfg.model, 'pca_components',        50),
-            use_statistical_features = getattr(cfg.model, 'use_statistical_features', True),
-            use_diff_features      = getattr(cfg.model, 'use_diff_features',     True),
-            random_state           = cfg.data.random_seed,
-        )
+    elif arch == "2ResNet":
+        print("  Architecture : Ensemble SE-ResNet8 + ResNet18")
+        return ensemble_resnet_1d(**common_torch)
 
     else:
         raise ValueError(
@@ -207,12 +199,8 @@ def _select_trainer(model, train_loader, val_loader, cfg):
     - LightGBM → LightGBMTrainer  (pas de backprop, pas de scheduler)
     - Tout modèle PyTorch nn.Module → Trainer classique
     """
-    if isinstance(model, LightGBM):
-        print("  Trainer : LightGBMTrainer")
-        return LightGBMTrainer(model, train_loader, val_loader, cfg)
-    else:
-        print("  Trainer : Trainer (PyTorch)")
-        return Trainer(model, train_loader, val_loader, cfg)
+    print("  Trainer : Trainer (PyTorch)")
+    return Trainer(model, train_loader, val_loader, cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,10 +615,13 @@ def print_training_summary(result: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="Entraînement du modèle exoplanète")
-    parser.add_argument('--config', type=str, default=None, help="Chemin vers la config YAML/JSON")
+    parser.add_argument('--config', type=str, default=None, help="Chemin vers la config JSON")
+    parser.add_argument('--arch', type=str, default='ResNetCNN',
+                        choices=list(ARCH_TO_CONFIG.keys()),
+                        help="Modèle à entraîner — charge models/<arch>/config.py")
     args = parser.parse_args()
 
-    cfg = Config.load(args.config) if args.config else get_config_object()
+    cfg = Config.load(args.config) if args.config else load_config_for_arch(args.arch)
     set_seed(cfg.data.random_seed)
     cfg.print_summary()
 

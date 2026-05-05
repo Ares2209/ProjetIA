@@ -41,39 +41,111 @@ class ExoplanetDataset(Dataset):
 
         self.original_size = len(self.spectra)
         self.total_size    = self.original_size * (1 + self.augmentation_factor)
+        
+    @staticmethod
+    def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Enrichit le DataFrame auxiliaire avec des features physiquement motivées.
 
+        Toutes les transformations sont déterministes (pas de fit) → peut être
+        appliqué sur le DataFrame complet AVANT le split train/val sans leakage.
 
-    def _normalize_auxiliary(self, df, mean=None, std=None):
-
+        Features ajoutées (par famille) :
+        1. Ratios dimensionnels  — difficiles à apprendre par division pour le réseau
+        2. Flux stellaire & température d'équilibre  — prédicteurs directs eau/nuages
+        3. Indicateur zone habitable
+        4. Logs de toutes les colonnes à grande dynamique  — stabilise les gradients
+        """
         df = df.copy()
 
-        log_cols = [
-            "star_mass_kg",
-            "star_radius_m",
-            "planet_mass_kg",
-            "semi_major_axis_m"
+        # Rapport masse planète / masse étoile : hiérarchie gravitationnelle du système
+        df['mass_ratio'] = df['planet_mass_kg'] / df['star_mass_kg']
+
+        # Rapport demi-grand axe / rayon stellaire : géométrie du transit
+        df['orbital_radius_ratio'] = df['semi_major_axis_m'] / df['star_radius_m']
+
+        # Densité stellaire proxy (∝ M/R³) : structure interne de l'étoile
+        df['star_density_proxy'] = df['star_mass_kg'] / df['star_radius_m'] ** 3
+
+        # ── 2. Flux stellaire et température d'équilibre ─────────────────────────
+
+        # Flux reçu par la planète (loi de Stefan-Boltzmann + géométrie en 1/r²)
+        # F ∝ T_star⁴ × (R_star / a)²   [unités relatives]
+        df['stellar_flux'] = (
+            df['star_temperature'] ** 4
+            * (df['star_radius_m'] / df['semi_major_axis_m']) ** 2
+        )
+
+        # Température d'équilibre (corps noir, albedo de Bond = 0.3)
+        # T_eq = T_star × sqrt(R_star / 2a) × (1 - A)^(1/4)
+        df['equilibrium_temp'] = (
+            df['star_temperature']
+            * np.sqrt(df['star_radius_m'] / (2 * df['semi_major_axis_m']))
+            * (0.7 ** 0.25)
+        )
+
+        # ── 3. Indicateur zone habitable ─────────────────────────────────────────
+
+        # Distance de la zone habitable : a pour lequel T_eq ≈ 255 K
+        hz_distance = df['star_radius_m'] * (df['star_temperature'] / 255.0) ** 2
+        # hz_ratio < 1 → trop proche (trop chaude)
+        # hz_ratio ≈ 1 → zone habitable
+        # hz_ratio > 1 → trop loin  (trop froide)
+        df['hz_ratio'] = df['semi_major_axis_m'] / hz_distance
+
+        # ── 4. Logs de toutes les colonnes à grande dynamique ────────────────────
+        # Réduit les ordres de grandeur (1e25 → 1e30) à des valeurs dans [25, 30]
+        # ce qui stabilise les activations du ResNet dès la première couche FC.
+        log_targets = [
+            'star_mass_kg',
+            'star_radius_m',
+            'star_temperature',
+            'planet_mass_kg',
+            'semi_major_axis_m',
+            'stellar_flux',
+            'equilibrium_temp',
+            'star_density_proxy',
+            'mass_ratio',
+            'orbital_radius_ratio',
         ]
-
-        for col in log_cols:
+        for col in log_targets:
             if col in df.columns:
-                df[col] = np.log10(df[col])
+                df[f'log_{col}'] = np.log10(df[col].clip(lower=1e-30))
 
-        features = df.select_dtypes(include=[np.number]).values.astype(np.float32)
+        return df
 
-        if mean is None:
-            mean = features.mean(axis=0)
-            std  = features.std(axis=0) + 1e-8
+    def _normalize_auxiliary(self, auxiliary_df: pd.DataFrame,
+                              aux_mean=None, aux_std=None):
+        """Applique _engineer_features puis normalise (mean=0, std=1)."""
+        df = ExoplanetDataset._engineer_features(auxiliary_df)
+        features = df.values.astype(np.float32)
 
-        normalized = (features - mean) / std
+        if aux_mean is None:
+            aux_mean = features.mean(axis=0)
+            aux_std  = features.std(axis=0) + 1e-8
 
-        return normalized, mean, std
+        normalized = (features - aux_mean) / aux_std
+        return normalized, aux_mean, aux_std
 
     def _normalize_spectra(self, spectra, mean=None, std=None):
         spectra = spectra.astype(np.float32)  # (N, 52, 3)
 
+        # Canaux dérivés calculés sur les données brutes (avant normalisation)
+        mu  = spectra[:, :, 0:1]   # (N, 52, 1) — profondeur moyenne
+        lo  = spectra[:, :, 1:2]   # (N, 52, 1) — borne basse de l'incertitude
+        hi  = spectra[:, :, 2:3]   # (N, 52, 1) — borne haute de l'incertitude
+
+        # Canal 4 : rapport signal/bruit (SNR) local — mesure la fiabilité de chaque point
+        snr  = mu / (0.5 * np.abs(hi - lo) + 1e-8)        # (N, 52, 1)
+
+        # Canal 5 : incertitude relative — normalise l'amplitude de l'incertitude
+        rel_unc = np.abs(hi - lo) / (np.abs(mu) + 1e-8)   # (N, 52, 1)
+
+        spectra = np.concatenate([spectra, snr, rel_unc], axis=2)  # (N, 52, 5)
+
         # Calcul par échantillon : mean/std sur les 52 pas de temps, par canal
-        mean = spectra.mean(axis=1, keepdims=True)          # (N, 1, 3)
-        std  = spectra.std(axis=1,  keepdims=True) + 1e-8   # (N, 1, 3)
+        mean = spectra.mean(axis=1, keepdims=True)          # (N, 1, 5)
+        std  = spectra.std(axis=1,  keepdims=True) + 1e-8   # (N, 1, 5)
 
         normalized = (spectra - mean) / std
 
@@ -88,9 +160,9 @@ class ExoplanetDataset(Dataset):
         via ses paramètres (mettre la prob/range à 0).
 
         Args:
-            spectrum : (52, 3)  float32  — copie déjà faite par l'appelant
+            spectrum : (52, 5)  float32  — copie déjà faite par l'appelant
         Returns:
-            spectrum augmenté : (52, 3)
+            spectrum augmenté : (52, 5)
         """
 
         if self.shift_range > 0:
@@ -144,9 +216,9 @@ class ExoplanetDataset(Dataset):
         return item
     
 def collate_fn(batch):
-    """Collation → spectres au format (B, 3, 52) pour Conv1d."""
-    spectra   = torch.stack([item['spectrum']  for item in batch])   # (B, 52, 3)
-    spectra   = spectra.permute(0, 2, 1)                             # (B, 3,  52)
+    """Collation → spectres au format (B, C, 52) pour Conv1d (C=5 avec canaux dérivés)."""
+    spectra   = torch.stack([item['spectrum']  for item in batch])   # (B, 52, C)
+    spectra   = spectra.permute(0, 2, 1)                             # (B, C,  52)
     auxiliary = torch.stack([item['auxiliary'] for item in batch])   # (B, n_feat)
     ids       = torch.LongTensor([item['id']   for item in batch])
 
