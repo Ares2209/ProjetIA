@@ -4,10 +4,14 @@ Module dédié à la production des figures à partir d'un historique
 d'entraînement (loss, métriques, matrice de confusion, etc.).
 """
 
+import logging
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,7 +56,7 @@ def plot_training_results(history: dict, save_dir: str = 'results'):
     # → on utilise val_loss comme référence de longueur si train_loss absent
     ref_series = _get(history, 'train_loss') or _get(history, 'val_loss')
     if not ref_series:
-        print("  Aucune donnée d'historique à tracer.")
+        logger.warning("Aucune donnée d'historique à tracer.")
         return
 
     epochs = range(1, len(ref_series) + 1)
@@ -174,7 +178,7 @@ def plot_training_results(history: dict, save_dir: str = 'results'):
     out = f'{save_dir}/training_history.png'
     plt.savefig(out, dpi=100, bbox_inches='tight')
     plt.close()
-    print(f"  Figure agrégée : {out}")
+    logger.info("Figure agrégée : %s", out)
 
     _create_individual_plots(history, epochs, save_dir)
 
@@ -274,4 +278,4 @@ def _create_individual_plots(history: dict, epochs, save_dir: str):
         ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
         _save('confusion_matrix_elements.png')
 
-    print(f"  Graphiques individuels : {save_dir}/")
+    logger.info("Graphiques individuels : %s/", save_dir)
