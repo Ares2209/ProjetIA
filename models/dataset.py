@@ -44,18 +44,6 @@ class ExoplanetDataset(Dataset):
         
     @staticmethod
     def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Enrichit le DataFrame auxiliaire avec des features physiquement motivées.
-
-        Toutes les transformations sont déterministes (pas de fit) → peut être
-        appliqué sur le DataFrame complet AVANT le split train/val sans leakage.
-
-        Features ajoutées (par famille) :
-        1. Ratios dimensionnels  — difficiles à apprendre par division pour le réseau
-        2. Flux stellaire & température d'équilibre  — prédicteurs directs eau/nuages
-        3. Indicateur zone habitable
-        4. Logs de toutes les colonnes à grande dynamique  — stabilise les gradients
-        """
         df = df.copy()
 
         # Rapport masse planète / masse étoile : hiérarchie gravitationnelle du système

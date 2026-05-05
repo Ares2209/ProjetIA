@@ -191,18 +191,6 @@ class Trainer:
         )
 
     def _setup_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
-        """
-        CORRECTION 3 : OneCycleLR dimensionné sur un horizon réaliste.
-
-        Problème original : total_steps = len(loader) * num_epochs (500)
-        → avec early stopping à ~120 epochs, le scheduler n'a parcouru que
-          24% de son cycle. La phase de descente finale (qui booste souvent
-          le MCC de 0.005-0.01) n'est jamais atteinte.
-
-        Solution : on estime l'horizon sur patience * 2 (borne réaliste),
-        avec un minimum de 50 epochs pour éviter un cycle trop court.
-        Cela garantit que le cycle LR est adapté à la durée réelle d'entraînement.
-        """
         patience = self.config.training.patience
         realistic_epochs = max(50, patience * 2)
         total_steps = len(self.train_loader) * realistic_epochs
@@ -252,23 +240,6 @@ class Trainer:
         all_labels: np.ndarray,
         n_steps: int = 81,
     ) -> tuple[float, float]:
-        """
-        Trouve le seuil qui maximise le MCC sur le set de validation.
-
-        Pourquoi c'est important :
-            Le MCC est sensible au seuil. Avec des classes déséquilibrées
-            ou un modèle légèrement biaisé, le seuil optimal peut être
-            très différent de 0.5. Un seuil à 0.45 vs 0.5 peut représenter
-            +0.01 à +0.03 de MCC sans aucun ré-entraînement.
-
-        Args:
-            all_probs  : probabilités de la classe 1, shape (N,)
-            all_labels : labels vrais (0 ou 1), shape (N,)
-            n_steps    : nombre de seuils testés dans [0.1, 0.9]
-
-        Returns:
-            (best_threshold, best_mcc)
-        """
         thresholds = np.linspace(0.1, 0.9, n_steps)
         mccs = []
         for t in thresholds:
