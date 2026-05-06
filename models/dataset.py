@@ -1,7 +1,38 @@
-import torch
-from torch.utils.data import Dataset
+"""Dataset Exoplanet — chargement spectres + features auxiliaires + augmentation cohérente.
+
+Pipeline d'un échantillon (canaux après _normalize_spectra) :
+    ch0 = mu       (profondeur moyenne)
+    ch1 = lo       (borne basse de l'incertitude)
+    ch2 = hi       (borne haute de l'incertitude)
+    ch3 = SNR      (canal dérivé)
+    ch4 = rel_unc  (canal dérivé)
+
+Politique d'augmentation :
+    - shift / scale partagés entre ch0/ch1/ch2 (préserve la cohérence physique)
+    - noise gaussien per-pixel sur ch0/ch1/ch2
+    - canaux dérivés (ch3, ch4) inchangés : ils décrivent la qualité de la
+      mesure originale, pas une version perturbée
+    - channel_dropout uniquement sur les canaux dérivés (métadonnées)
+    - pas de flip horizontal (les bandes d'absorption sont à des longueurs
+      d'onde fixes, le flip détruit l'information physique)
+"""
+
+import logging
+import random
+import warnings
+
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+
+logger = logging.getLogger(__name__)
+
+# Index des canaux après _normalize_spectra
+CH_MU, CH_LO, CH_HI, CH_SNR, CH_REL_UNC = 0, 1, 2, 3, 4
+SIGNAL_CHANNELS = slice(0, 3)        # ch0, ch1, ch2
+META_CHANNELS   = (CH_SNR, CH_REL_UNC)
 
 
 class ExoplanetDataset(Dataset):
@@ -13,9 +44,8 @@ class ExoplanetDataset(Dataset):
         is_train=True,
         augmentation_factor=0,
         shift_range=0.05,
-        scale_range=0.1,
+        scale_range=0.10,
         noise_std=0.02,
-        flip_prob=0,
         channel_dropout_prob=0.1,
         aux_mean=None,
         aux_std=None,
@@ -26,75 +56,63 @@ class ExoplanetDataset(Dataset):
         self.shift_range          = shift_range
         self.scale_range          = scale_range
         self.noise_std            = noise_std
-        self.flip_prob            = flip_prob
         self.channel_dropout_prob = channel_dropout_prob
 
-        # Stats auxiliaires : calculées sur train, passées en val/test
+        # Garde-fou : val/test doivent recevoir aux_mean/aux_std du train
+        if not is_train and aux_mean is None:
+            warnings.warn(
+                "Dataset val/test sans aux_mean/aux_std du train : "
+                "stats recalculées sur ce split (data leakage probable).",
+                UserWarning, stacklevel=2,
+            )
+
         self.aux_features, self.aux_mean, self.aux_std = self._normalize_auxiliary(
             auxiliary_df, aux_mean, aux_std
         )
 
-        # Per-sample → pas de paramètres à partager
+        # spectres : (N, 52, 5) après ajout des canaux dérivés et normalisation
         self.spectra, self.spectra_mean, self.spectra_std = self._normalize_spectra(spectra)
 
         self.targets = targets_df.reset_index(drop=True) if targets_df is not None else None
 
         self.original_size = len(self.spectra)
         self.total_size    = self.original_size * (1 + self.augmentation_factor)
-        
+
     @staticmethod
     def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+        """Enrichit le DataFrame auxiliaire avec des features physiquement motivées.
+
+        Toutes les transformations sont déterministes (pas de fit) → peut être
+        appliqué sur le DataFrame complet AVANT le split train/val sans leakage.
+        """
         df = df.copy()
 
-        # Rapport masse planète / masse étoile : hiérarchie gravitationnelle du système
-        df['mass_ratio'] = df['planet_mass_kg'] / df['star_mass_kg']
+        # Ratios dimensionnels
+        df['mass_ratio']           = df['planet_mass_kg']     / df['star_mass_kg']
+        df['orbital_radius_ratio'] = df['semi_major_axis_m']  / df['star_radius_m']
+        df['star_density_proxy']   = df['star_mass_kg']       / df['star_radius_m'] ** 3
 
-        # Rapport demi-grand axe / rayon stellaire : géométrie du transit
-        df['orbital_radius_ratio'] = df['semi_major_axis_m'] / df['star_radius_m']
-
-        # Densité stellaire proxy (∝ M/R³) : structure interne de l'étoile
-        df['star_density_proxy'] = df['star_mass_kg'] / df['star_radius_m'] ** 3
-
-        # ── 2. Flux stellaire et température d'équilibre ─────────────────────────
-
-        # Flux reçu par la planète (loi de Stefan-Boltzmann + géométrie en 1/r²)
-        # F ∝ T_star⁴ × (R_star / a)²   [unités relatives]
+        # Flux stellaire et température d'équilibre
         df['stellar_flux'] = (
             df['star_temperature'] ** 4
             * (df['star_radius_m'] / df['semi_major_axis_m']) ** 2
         )
-
-        # Température d'équilibre (corps noir, albedo de Bond = 0.3)
-        # T_eq = T_star × sqrt(R_star / 2a) × (1 - A)^(1/4)
         df['equilibrium_temp'] = (
             df['star_temperature']
             * np.sqrt(df['star_radius_m'] / (2 * df['semi_major_axis_m']))
-            * (0.7 ** 0.25)
+            * (0.7 ** 0.25)   # albedo de Bond = 0.3
         )
 
-        # ── 3. Indicateur zone habitable ─────────────────────────────────────────
-
-        # Distance de la zone habitable : a pour lequel T_eq ≈ 255 K
+        # Indicateur zone habitable
         hz_distance = df['star_radius_m'] * (df['star_temperature'] / 255.0) ** 2
-        # hz_ratio < 1 → trop proche (trop chaude)
-        # hz_ratio ≈ 1 → zone habitable
-        # hz_ratio > 1 → trop loin  (trop froide)
         df['hz_ratio'] = df['semi_major_axis_m'] / hz_distance
 
-        # ── 4. Logs de toutes les colonnes à grande dynamique ────────────────────
-        # Réduit les ordres de grandeur (1e25 → 1e30) à des valeurs dans [25, 30]
-        # ce qui stabilise les activations du ResNet dès la première couche FC.
+        # Logs des colonnes à grande dynamique
         log_targets = [
-            'star_mass_kg',
-            'star_radius_m',
-            'star_temperature',
-            'planet_mass_kg',
-            'semi_major_axis_m',
-            'stellar_flux',
-            'equilibrium_temp',
-            'star_density_proxy',
-            'mass_ratio',
-            'orbital_radius_ratio',
+            'star_mass_kg', 'star_radius_m', 'star_temperature',
+            'planet_mass_kg', 'semi_major_axis_m',
+            'stellar_flux', 'equilibrium_temp', 'star_density_proxy',
+            'mass_ratio', 'orbital_radius_ratio',
         ]
         for col in log_targets:
             if col in df.columns:
@@ -103,7 +121,7 @@ class ExoplanetDataset(Dataset):
         return df
 
     def _normalize_auxiliary(self, auxiliary_df: pd.DataFrame,
-                              aux_mean=None, aux_std=None):
+                             aux_mean=None, aux_std=None):
         """Applique _engineer_features puis normalise (mean=0, std=1)."""
         df = ExoplanetDataset._engineer_features(auxiliary_df)
         features = df.values.astype(np.float32)
@@ -115,63 +133,59 @@ class ExoplanetDataset(Dataset):
         normalized = (features - aux_mean) / aux_std
         return normalized, aux_mean, aux_std
 
-    def _normalize_spectra(self, spectra, mean=None, std=None):
-        spectra = spectra.astype(np.float32)  # (N, 52, 3)
+    def _normalize_spectra(self, spectra):
+        """Ajoute SNR + incertitude relative puis normalise per-sample.
 
-        # Canaux dérivés calculés sur les données brutes (avant normalisation)
-        mu  = spectra[:, :, 0:1]   # (N, 52, 1) — profondeur moyenne
-        lo  = spectra[:, :, 1:2]   # (N, 52, 1) — borne basse de l'incertitude
-        hi  = spectra[:, :, 2:3]   # (N, 52, 1) — borne haute de l'incertitude
+        Entrée : (N, 52, 3) — mu, lo, hi
+        Sortie : (N, 52, 5) — mu, lo, hi, SNR, rel_unc, normalisés
+                              par échantillon et par canal
+        """
+        spectra = spectra.astype(np.float32)
+        mu = spectra[:, :, 0:1]   # (N, 52, 1)
+        lo = spectra[:, :, 1:2]
+        hi = spectra[:, :, 2:3]
 
-        # Canal 4 : rapport signal/bruit (SNR) local — mesure la fiabilité de chaque point
-        snr  = mu / (0.5 * np.abs(hi - lo) + 1e-8)        # (N, 52, 1)
+        snr     = mu / (0.5 * np.abs(hi - lo) + 1e-8)
+        rel_unc = np.abs(hi - lo) / (np.abs(mu) + 1e-8)
 
-        # Canal 5 : incertitude relative — normalise l'amplitude de l'incertitude
-        rel_unc = np.abs(hi - lo) / (np.abs(mu) + 1e-8)   # (N, 52, 1)
+        spectra = np.concatenate([spectra, snr, rel_unc], axis=2)   # (N, 52, 5)
 
-        spectra = np.concatenate([spectra, snr, rel_unc], axis=2)  # (N, 52, 5)
-
-        # Calcul par échantillon : mean/std sur les 52 pas de temps, par canal
-        mean = spectra.mean(axis=1, keepdims=True)          # (N, 1, 5)
-        std  = spectra.std(axis=1,  keepdims=True) + 1e-8   # (N, 1, 5)
-
+        mean = spectra.mean(axis=1, keepdims=True)
+        std  = spectra.std(axis=1, keepdims=True) + 1e-8
         normalized = (spectra - mean) / std
 
-        # On retourne None pour mean/std : inutiles en per-sample
-        # (la val/test se normalisent elles-mêmes)
+        # Per-sample : pas de stats à partager avec val/test
         return normalized, None, None
 
     def _augment_spectrum(self, spectrum: np.ndarray) -> np.ndarray:
-        """
-        Pipeline d'augmentation appliqué aléatoirement.
-        Chaque transformation est indépendante et peut être désactivée
-        via ses paramètres (mettre la prob/range à 0).
+        """Augmentation cohérente pour spectres (52, 5).
 
-        Args:
-            spectrum : (52, 5)  float32  — copie déjà faite par l'appelant
-        Returns:
-            spectrum augmenté : (52, 5)
+        - shift / scale appliqués UNIFORMÉMENT à (mu, lo, hi) → ratios préservés
+        - bruit gaussien per-pixel sur (mu, lo, hi)
+        - canaux dérivés (SNR, rel_unc) NON modifiés par shift/scale/noise :
+          ils gardent leur sens de "métadonnée de qualité de la mesure brute"
+        - channel_dropout : uniquement sur les canaux dérivés
         """
-
+        # shift partagé entre mu/lo/hi (un scalaire pour les 3)
         if self.shift_range > 0:
-            shift = np.random.uniform(-self.shift_range, self.shift_range,
-                                      size=(1, spectrum.shape[1]))   # (1, 3)
-            spectrum = spectrum + shift
+            shift = float(np.random.uniform(-self.shift_range, self.shift_range))
+            spectrum[:, SIGNAL_CHANNELS] += shift
 
+        # scale partagé entre mu/lo/hi
         if self.scale_range > 0:
-            scale = np.random.uniform(1 - self.scale_range, 1 + self.scale_range,
-                                      size=(1, spectrum.shape[1]))   # (1, 3)
-            spectrum = spectrum * scale
+            scale = float(np.random.uniform(1 - self.scale_range, 1 + self.scale_range))
+            spectrum[:, SIGNAL_CHANNELS] *= scale
 
+        # bruit indépendant par pixel et par canal du signal brut
         if self.noise_std > 0:
-            noise    = np.random.normal(0, self.noise_std, size=spectrum.shape)
-            spectrum = spectrum + noise
+            noise = np.random.normal(
+                0, self.noise_std, size=(spectrum.shape[0], 3),
+            ).astype(np.float32)
+            spectrum[:, SIGNAL_CHANNELS] += noise
 
-        if self.flip_prob > 0 and np.random.rand() < self.flip_prob:
-            spectrum = spectrum[::-1].copy()   # .copy() pour contiguïté mémoire
-
+        # dropout des canaux dérivés (métadonnées) seulement
         if self.channel_dropout_prob > 0:
-            for c in range(spectrum.shape[1]):
+            for c in META_CHANNELS:
                 if np.random.rand() < self.channel_dropout_prob:
                     spectrum[:, c] = 0.0
 
@@ -184,7 +198,7 @@ class ExoplanetDataset(Dataset):
         original_idx = idx % self.original_size
         aug_version  = idx // self.original_size   # 0 = original, >0 = augmenté
 
-        spectrum = self.spectra[original_idx].copy()   # (52, 3) — copie obligatoire
+        spectrum = self.spectra[original_idx].copy()   # (52, 5) — copie obligatoire
         aux_feat = self.aux_features[original_idx]
 
         if aug_version > 0 and self.is_train and self.augmentation_factor > 0:
@@ -202,11 +216,26 @@ class ExoplanetDataset(Dataset):
             item['target'] = torch.FloatTensor([eau, nuage])
 
         return item
-    
+
+
+def seed_worker(_worker_id: int) -> None:
+    """À passer en `worker_init_fn` du DataLoader.
+
+    Sans ça, chaque worker hérite du même état numpy/random que le process
+    parent → mêmes augmentations en parallèle. Cette fonction utilise la seed
+    propre à chaque worker (générée par PyTorch) pour réinitialiser numpy et
+    random, garantissant des augmentations diverses entre workers et stables
+    entre epochs.
+    """
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
+
+
 def collate_fn(batch):
-    """Collation → spectres au format (B, C, 52) pour Conv1d (C=5 avec canaux dérivés)."""
+    """Collation → spectres au format (B, C, 52) pour Conv1d (C=5)."""
     spectra   = torch.stack([item['spectrum']  for item in batch])   # (B, 52, C)
-    spectra   = spectra.permute(0, 2, 1)                             # (B, C,  52)
+    spectra   = spectra.permute(0, 2, 1)                             # (B, C, 52)
     auxiliary = torch.stack([item['auxiliary'] for item in batch])   # (B, n_feat)
     ids       = torch.LongTensor([item['id']   for item in batch])
 

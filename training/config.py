@@ -119,8 +119,7 @@ class DataConfig:
     shift_range: float = 0.05             # décalage additif max (fraction de la std)
     scale_range: float = 0.10             # mise à l'échelle multiplicative max
     noise_std: float = 0.02               # écart-type du bruit gaussien
-    flip_prob: float = 0                # proba de retourner le spectre
-    channel_dropout_prob: float = 0.1     # proba de zeroing d'un canal
+    channel_dropout_prob: float = 0.1     # proba de zeroing d'un canal dérivé
 
     # Seed
     random_seed: int = 42
@@ -129,8 +128,6 @@ class DataConfig:
         """Validation."""
         if self.train_ratio + self.val_ratio > 1.0:
             raise ValueError("train_ratio + val_ratio cannot exceed 1.0")
-        if not 0.0 <= self.flip_prob <= 1.0:
-            raise ValueError("flip_prob must be between 0 and 1")
         if not 0.0 <= self.channel_dropout_prob <= 1.0:
             raise ValueError("channel_dropout_prob must be between 0 and 1")
         if self.augmentation_factor < 0:

@@ -25,7 +25,7 @@ from training.utils import (
     setup_logging,
 )
 from training.plot import plot_training_results
-from models.dataset import ExoplanetDataset, collate_fn
+from models.dataset import ExoplanetDataset, collate_fn, seed_worker
 from models.CNN import CNN
 from models.ResNetCNN import ResNet1D, resnet18_1d, resnet34_1d, resnet8_1d, ensemble_resnet_1d
 
@@ -116,7 +116,6 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
         shift_range          = data_cfg.shift_range,
         scale_range          = data_cfg.scale_range,
         noise_std            = data_cfg.noise_std,
-        flip_prob            = data_cfg.flip_prob,
         channel_dropout_prob = data_cfg.channel_dropout_prob,
     )
     val_dataset = ExoplanetDataset(
@@ -130,10 +129,11 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
     )
 
     loader_kwargs = dict(
-        batch_size  = config.training.batch_size,
-        num_workers = data_cfg.num_workers,
-        pin_memory  = data_cfg.pin_memory,
-        collate_fn  = collate_fn,
+        batch_size     = config.training.batch_size,
+        num_workers    = data_cfg.num_workers,
+        pin_memory     = data_cfg.pin_memory,
+        collate_fn     = collate_fn,
+        worker_init_fn = seed_worker,   # seed numpy/random par worker
     )
     train_loader = DataLoader(train_dataset, shuffle=True,  **loader_kwargs)
     val_loader   = DataLoader(val_dataset,   shuffle=False, **loader_kwargs)
