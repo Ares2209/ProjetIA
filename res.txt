@@ -1,0 +1,18 @@
+07:53:59 | INFO    | ==========================================================================================
+07:53:59 | INFO    |  RÉSUMÉ POST-ENTRAÎNEMENT
+07:53:59 | INFO    | ==========================================================================================
+07:53:59 | INFO    | Epochs : 96  |  Meilleure : 46  |  Durée : 0.13h (8.1min)  |  Early stopping : Oui
+07:53:59 | INFO    | Métriques Val — Epoch 46 :
+07:53:59 | INFO    |     Accuracy         0.9767
+07:53:59 | INFO    |     Balanced Acc     0.9767
+07:53:59 | INFO    |     Precision        0.9704
+07:53:59 | INFO    |     Recall           0.9833
+07:53:59 | INFO    |     Specificity      0.9700
+07:53:59 | INFO    |     F1               0.9768
+07:53:59 | INFO    |     F2               0.9807
+07:53:59 | INFO    |     IoU              0.9547
+07:53:59 | INFO    |     Cohen κ          0.9533
+07:53:59 | INFO    |     MCC              0.9534
+07:53:59 | INFO    | Confusion (Val) :  TP   295 | FP     9
+07:53:59 | INFO    |                    FN     5 | TN   291
+07:53:59 | INFO    | Probabilistes :  AUROC 0.9890  |  AUPRC 0.9774  |  Brier 0.0200

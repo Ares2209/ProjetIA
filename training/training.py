@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.swa_utils import AveragedModel
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
@@ -11,6 +12,7 @@ from typing import Dict, Optional, Any
 from dataclasses import dataclass, field
 from sklearn.metrics import matthews_corrcoef
 import time
+from pathlib import Path
 
 from .metrique import MetricsCalculator, MetricsAccumulator
 from .Loss import BCE
@@ -159,6 +161,23 @@ class Trainer:
 
         if config.training.preload:
             self._load_pretrained(config.training.preload)
+
+        # Stochastic Weight Averaging (optionnel)
+        self.use_swa = bool(getattr(config.training, 'use_swa', False))
+        if self.use_swa:
+            self.swa_model = AveragedModel(self.model)
+            self.swa_start_pct = float(getattr(config.training, 'swa_start_pct', 0.75))
+            print(f"   • SWA activé : moyennage des poids à partir de {self.swa_start_pct:.0%}"
+                  f" du training")
+        else:
+            self.swa_model = None
+            self.swa_start_pct = 1.0
+
+        # Mixup (optionnel)
+        self.use_mixup   = bool(getattr(config.training, 'use_mixup', False))
+        self.mixup_alpha = float(getattr(config.training, 'mixup_alpha', 0.2))
+        if self.use_mixup:
+            print(f"   • Mixup activé : Beta(α={self.mixup_alpha}, α={self.mixup_alpha})")
 
         print(f"\nTrainer initialisé:")
         print(f"   • Device: {self.device}")
@@ -355,6 +374,17 @@ class Trainer:
         for batch_idx, batch in enumerate(pbar):
             spectra, auxiliary, labels = self._unpack_batch(batch)
 
+            # Mixup : interpolation (x_a, y_a) + (x_b, y_b) avec λ ~ Beta(α, α)
+            # Compatible avec BCE car les labels mixtes sont continus
+            mixed = False
+            if self.use_mixup and self.model.training:
+                lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
+                idx = torch.randperm(spectra.size(0), device=spectra.device)
+                spectra   = lam * spectra   + (1.0 - lam) * spectra[idx]
+                auxiliary = lam * auxiliary + (1.0 - lam) * auxiliary[idx]
+                labels    = lam * labels    + (1.0 - lam) * labels[idx]
+                mixed = True
+
             self.optimizer.zero_grad()
             predictions = self.model(spectra, auxiliary)
             loss = self.criterion(predictions, labels)
@@ -372,24 +402,28 @@ class Trainer:
             total_loss += batch_loss
             self.state.history['iteration_losses'].append(batch_loss)
 
+            smoothed = None
             with torch.no_grad():
                 class_idx = min(1, predictions.shape[1] - 1)
                 preds_cls  = predictions[:, class_idx]
                 labels_cls = labels[:, class_idx]
-                metrics_accum.update(preds_cls, labels_cls, store_for_probabilistic=True)
 
-                # CORRECTION 4 : fenêtre glissante pour la pbar
-                window_preds.append(preds_cls.cpu())
-                window_labels.append(labels_cls.cpu())
-                if len(window_preds) > window_size:
-                    window_preds.pop(0)
-                    window_labels.pop(0)
+                # Sur les batches mixés, les labels sont continus dans [0,1] → les
+                # métriques (MCC, F1) deviennent du bruit. On les skip.
+                if not mixed:
+                    metrics_accum.update(preds_cls, labels_cls, store_for_probabilistic=True)
+                    window_preds.append(preds_cls.cpu())
+                    window_labels.append(labels_cls.cpu())
+                    if len(window_preds) > window_size:
+                        window_preds.pop(0)
+                        window_labels.pop(0)
 
-                w_preds  = torch.cat(window_preds)
-                w_labels = torch.cat(window_labels)
-                smoothed = self.metrics_calculator.compute_metrics(w_preds, w_labels)
+                if window_preds:
+                    w_preds  = torch.cat(window_preds)
+                    w_labels = torch.cat(window_labels)
+                    smoothed = self.metrics_calculator.compute_metrics(w_preds, w_labels)
 
-            if (batch_idx + 1) % log_every == 0:
+            if smoothed is not None and (batch_idx + 1) % log_every == 0:
                 self.writer.add_scalar('Train/Loss_iter', batch_loss, self.state.global_step)
                 self.writer.add_scalar('Train/LR', self._get_lr(), self.state.global_step)
                 self.writer.add_scalar('Train/MCC_iter', smoothed.mcc, self.state.global_step)
@@ -398,13 +432,16 @@ class Trainer:
                 )
 
             self.state.global_step += 1
-            pbar.set_postfix({
-                'loss': f'{batch_loss:.4f}',
-                'mcc': f'{smoothed.mcc:.4f}',      # lissé sur 5 batches
-                'bal_acc': f'{smoothed.balanced_accuracy:.4f}',
-                'f1': f'{smoothed.f1:.4f}',
-                'lr': f'{self._get_lr():.2e}',
-            })
+            postfix = {'loss': f'{batch_loss:.4f}', 'lr': f'{self._get_lr():.2e}'}
+            if smoothed is not None:
+                postfix.update({
+                    'mcc':     f'{smoothed.mcc:.4f}',
+                    'bal_acc': f'{smoothed.balanced_accuracy:.4f}',
+                    'f1':      f'{smoothed.f1:.4f}',
+                })
+            else:
+                postfix['mixed'] = '1'
+            pbar.set_postfix(postfix)
 
         avg_loss = total_loss / len(self.train_loader)
         epoch_metrics = metrics_accum.compute(compute_probabilistic=True)
@@ -626,12 +663,23 @@ class Trainer:
                     except Exception as e:
                         print(f"⚠️  Erreur sauvegarde checkpoint périodique: {e}\n")
 
+                # SWA : moyenne des poids sur les dernières epochs
+                swa_start_epoch = int(num_epochs * self.swa_start_pct)
+                if self.use_swa and epoch >= swa_start_epoch:
+                    self.swa_model.update_parameters(self.model)
+
                 if self.state.patience_counter >= patience:
                     self._log_early_stopping(epoch, patience, best_metrics)
                     break
 
             elapsed_time = time.time() - start_time
             self._log_final_summary(epoch, num_epochs, elapsed_time, patience, best_metrics)
+
+            # SWA : recalcul BN + validation + sauvegarde du modèle moyenné
+            swa_metrics = None
+            if self.use_swa and self.swa_model is not None:
+                swa_metrics = self._finalize_swa()
+
             self.writer.close()
 
             return {
@@ -643,6 +691,7 @@ class Trainer:
                 'history': self.state.get_history(),
                 # CORRECTION 1 : exposer le seuil optimal dans le résultat final
                 'best_threshold': self.state.best_threshold,
+                'swa_metrics': swa_metrics,
             }
 
         except KeyboardInterrupt:
@@ -657,6 +706,74 @@ class Trainer:
             traceback.print_exc()
             self.writer.close()
             raise
+
+    # =========================================================================
+    # SWA — recalcul BN + validation du modèle moyenné
+    # =========================================================================
+
+    def _update_swa_bn(self):
+        """Recalcule les running stats des BatchNorm pour `self.swa_model`.
+
+        `torch.optim.swa_utils.update_bn` ne supporte pas les modèles à
+        plusieurs entrées (notre forward = `model(spectra, auxiliary)`).
+        On reproduit la même logique en passant explicitement les deux tenseurs.
+        """
+        model = self.swa_model
+
+        momenta = {}
+        for module in model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.reset_running_stats()
+                momenta[module] = module.momentum
+                module.momentum = None   # → moving average cumulative
+
+        was_training = model.training
+        model.train()
+
+        n = 0
+        with torch.no_grad():
+            for batch in tqdm(self.train_loader, desc="SWA BN update", leave=False):
+                spectra, auxiliary, _ = self._unpack_batch(batch)
+                b = spectra.size(0)
+                for module in momenta:
+                    module.momentum = b / float(n + b)
+                model(spectra, auxiliary)
+                n += b
+
+        for module, mom in momenta.items():
+            module.momentum = mom
+        model.train(was_training)
+
+    def _finalize_swa(self) -> Dict[str, float]:
+        """Met à jour les BN du SWA, valide, sauvegarde le checkpoint."""
+        print(f"\n{'=' * 90}")
+        print(" FINALISATION SWA")
+        print(f"{'=' * 90}")
+
+        self._update_swa_bn()
+
+        # Validation : on swap temporairement self.model pour réutiliser self.validate()
+        original_model = self.model
+        self.model = self.swa_model
+        try:
+            swa_val_metrics = self.validate()
+        finally:
+            self.model = original_model
+
+        # Sauvegarde : on extrait les poids du module wrappé
+        swa_path = Path(self.config.paths.model_folder) / f"{self.config.paths.model_basename}_swa.pth"
+        torch.save({
+            'model_state_dict': self.swa_model.module.state_dict(),
+            'metrics': swa_val_metrics,
+        }, swa_path)
+
+        print(f"  SWA val MCC@best : {swa_val_metrics.get('mcc_at_best_threshold', 0):.4f}")
+        print(f"  SWA val MCC@0.5  : {swa_val_metrics.get('mcc', 0):.4f}")
+        print(f"  Composite        : {swa_val_metrics.get('composite_score', 0):.4f}")
+        print(f"  Sauvegardé       : {swa_path}")
+        print(f"{'=' * 90}\n")
+
+        return swa_val_metrics
 
     # =========================================================================
     # CALLBACKS D'AMÉLIORATION

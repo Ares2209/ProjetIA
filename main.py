@@ -65,8 +65,8 @@ def _resolve_path(configured: Path, fallback: Path, label: str) -> Path:
     return fallback
 
 
-def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
-    """Construit les DataLoaders train/val avec split stratifié."""
+def load_raw_data(config):
+    """Charge spectres / auxiliaires / targets depuis le disque (paths config + fallback)."""
     data_cfg      = config.data
     fallback_root = Path('Défi-IA-2026') / 'DATA' / 'defi-ia-cnes'
 
@@ -78,18 +78,22 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
     logger.info("auxiliary : %s", aux_path)
     logger.info("targets   : %s", targets_path)
 
-    spectra_all    = np.load(spectra_path)
-    aux_df_all     = pd.read_csv(aux_path)
-    targets_df_all = pd.read_csv(targets_path)
+    return {
+        'spectra':    np.load(spectra_path),
+        'auxiliary':  pd.read_csv(aux_path),
+        'targets':    pd.read_csv(targets_path),
+    }
 
-    strat_labels = targets_df_all['eau'].astype(str) + "_" + targets_df_all['nuage'].astype(str)
-    indices      = list(range(len(spectra_all)))
-    train_idx, val_idx = train_test_split(
-        indices,
-        test_size    = 1 - data_cfg.train_ratio,
-        random_state = 42,
-        stratify     = strat_labels,
-    )
+
+def build_dataloaders_from_indices(data, train_idx, val_idx, config):
+    """Construit les DataLoaders train/val à partir d'indices déjà séparés.
+
+    Réutilisable pour split simple ET k-fold (chaque fold appelle ça avec ses indices).
+    """
+    data_cfg = config.data
+    spectra_all    = data['spectra']
+    aux_df_all     = data['auxiliary']
+    targets_df_all = data['targets']
 
     spectra_train = spectra_all[train_idx]
     spectra_val   = spectra_all[val_idx]
@@ -98,14 +102,7 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
     targets_train = targets_df_all.iloc[train_idx].reset_index(drop=True)
     targets_val   = targets_df_all.iloc[val_idx].reset_index(drop=True)
 
-    logger.info("Distribution TRAIN — eau :\n%s",
-                targets_train['eau'].value_counts(normalize=True).to_string())
-    logger.info("Distribution TRAIN — nuage :\n%s",
-                targets_train['nuage'].value_counts(normalize=True).to_string())
-    logger.info("Distribution VAL — eau :\n%s",
-                targets_val['eau'].value_counts(normalize=True).to_string())
-    logger.info("Distribution VAL — nuage :\n%s",
-                targets_val['nuage'].value_counts(normalize=True).to_string())
+    logger.info("Train: %d  |  Val: %d", len(train_idx), len(val_idx))
 
     train_dataset = ExoplanetDataset(
         spectra              = spectra_train,
@@ -126,6 +123,8 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
         augmentation_factor = 0,
         aux_mean            = train_dataset.aux_mean,
         aux_std             = train_dataset.aux_std,
+        spectra_mean        = train_dataset.spectra_mean,
+        spectra_std         = train_dataset.spectra_std,
     )
 
     loader_kwargs = dict(
@@ -133,18 +132,37 @@ def build_dataloaders(config) -> tuple[DataLoader, DataLoader, dict]:
         num_workers    = data_cfg.num_workers,
         pin_memory     = data_cfg.pin_memory,
         collate_fn     = collate_fn,
-        worker_init_fn = seed_worker,   # seed numpy/random par worker
+        worker_init_fn = seed_worker,
     )
     train_loader = DataLoader(train_dataset, shuffle=True,  **loader_kwargs)
     val_loader   = DataLoader(val_dataset,   shuffle=False, **loader_kwargs)
 
+    # Stats issues du dataset normalisé (1, 52, 5) — shape garantie par _normalize_spectra
+    _, n_lambda, n_channels = train_dataset.spectra_mean.shape
     dataset_info = {
-        'spectrum_length': train_dataset.spectra.shape[1],
+        'spectrum_length': n_lambda,
         'auxiliary_dim':   train_dataset.aux_features.shape[1],
-        'input_channels':  train_dataset.spectra.shape[2],
+        'input_channels':  n_channels,
+        'train_dataset':   train_dataset,
+        'val_dataset':     val_dataset,
     }
-    del spectra_all
     return train_loader, val_loader, dataset_info
+
+
+def build_dataloaders(config):
+    """Construit les DataLoaders train/val avec split stratifié simple."""
+    data = load_raw_data(config)
+
+    strat_labels = (
+        data['targets']['eau'].astype(str) + "_" + data['targets']['nuage'].astype(str)
+    )
+    train_idx, val_idx = train_test_split(
+        list(range(len(data['spectra']))),
+        test_size    = 1 - config.data.train_ratio,
+        random_state = config.data.random_seed,
+        stratify     = strat_labels,
+    )
+    return build_dataloaders_from_indices(data, train_idx, val_idx, config)
 
 
 def build_model(cfg, spectrum_length: int, auxiliary_dim: int):
@@ -213,6 +231,11 @@ def main():
                         help="Duplique les logs dans ce fichier")
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    parser.add_argument('--cv', type=int, default=0,
+                        help="K folds de cross-validation stratifiée (0 = single split)")
+    parser.add_argument('--seeds', type=int, nargs='+', default=None,
+                        help="Seeds pour ensembling (ex: --seeds 42 7 123). Par défaut : "
+                             "[cfg.data.random_seed].")
     args = parser.parse_args()
 
     setup_logging(level=getattr(logging, args.log_level), log_file=args.log_file)
@@ -220,6 +243,18 @@ def main():
     cfg = Config.load(args.config) if args.config else load_config_for_arch(args.arch)
     set_seed(cfg.data.random_seed)
     cfg.print_summary()
+
+    # ── MODE CROSS-VALIDATION ──────────────────────────────────────────────
+    if args.cv and args.cv > 1:
+        from training.cv import cross_validate
+        seeds = tuple(args.seeds) if args.seeds else (cfg.data.random_seed,)
+        logger.info("── Cross-validation %d folds × %d seeds ──", args.cv, len(seeds))
+        cv_result = cross_validate(cfg, n_splits=args.cv, seeds=seeds)
+        logger.info("CV terminé. MCC OOF mean=%.4f (eau=%.4f, nuage=%.4f)",
+                    cv_result['aggregate']['mcc_mean'],
+                    cv_result['aggregate']['mcc_eau'],
+                    cv_result['aggregate']['mcc_nuage'])
+        return
 
     logger.info("── Chargement des données ──")
     train_loader, val_loader, dataset_info = build_dataloaders(cfg)

@@ -80,6 +80,15 @@ class TrainingConfig:
     use_multi_gpu: bool = False
     gpu_ids: Optional[List[int]] = None
     distributed_backend: str = 'dp'
+
+    # Stochastic Weight Averaging (SWA) — moyenne des poids des dernières epochs
+    use_swa: bool = False
+    swa_start_pct: float = 0.75   # démarre à 75% du training
+    swa_anneal_epochs: int = 5    # epochs d'annealing (info uniquement, on garde OneCycleLR)
+
+    # Mixup — interpolation linéaire d'échantillons (régularisation small-data)
+    use_mixup: bool = False
+    mixup_alpha: float = 0.2      # paramètre Beta(α, α) ; 0.2 = mixage modéré
     
     def __post_init__(self):
         """Validation."""

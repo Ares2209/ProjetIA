@@ -141,6 +141,78 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, label_name: str) -> 
     }
 
 
+def run_inference_tta(
+    model: torch.nn.Module,
+    raw_spectra: np.ndarray,
+    aux_df: pd.DataFrame,
+    targets_df: Optional[pd.DataFrame],
+    base_dataset: ExoplanetDataset,
+    device: torch.device,
+    n_aug: int = 10,
+    batch_size: int = 64,
+    threshold: float = 0.5,
+    weight_orig: float = 0.3,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """Test-Time Augmentation : 1 pass original + N pass augmentées, moyenne pondérée.
+
+    Args:
+        base_dataset : dataset non-augmenté (déjà construit avec stats train)
+                       — utilisé pour récupérer aux_mean, aux_std, spectra_mean, spectra_std
+                       et pour la passe sans augmentation.
+        n_aug        : nombre de passes augmentées (10-20 typique).
+        weight_orig  : poids de la passe originale dans la moyenne finale.
+                       proba_finale = weight_orig * proba_orig + (1-weight_orig) * mean(proba_aug).
+
+    Returns:
+        (probabilities, predictions, true_labels_or_None, ids)
+    """
+    has_targets = targets_df is not None
+
+    # 1) Passe originale (sans augmentation)
+    base_loader = DataLoader(
+        base_dataset, batch_size=batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=0,
+    )
+    probs_orig, _, true_labels, ids = run_inference(
+        model, base_loader, device, threshold=threshold, has_targets=has_targets,
+    )
+
+    if n_aug <= 0:
+        return probs_orig, (probs_orig >= threshold).astype(int), true_labels, ids
+
+    # 2) Dataset augmenté (réutilise les stats du base_dataset → cohérence)
+    aug_dataset = ExoplanetDataset(
+        spectra              = raw_spectra,
+        auxiliary_df         = aux_df,
+        targets_df           = targets_df,
+        is_train             = True,
+        augmentation_factor  = n_aug,
+        aux_mean             = base_dataset.aux_mean,
+        aux_std              = base_dataset.aux_std,
+        spectra_mean         = base_dataset.spectra_mean,
+        spectra_std          = base_dataset.spectra_std,
+    )
+
+    # On accède uniquement aux versions augmentées (idx >= N)
+    N = aug_dataset.original_size
+    aug_indices = list(range(N, N * (1 + n_aug)))
+    aug_loader = DataLoader(
+        torch.utils.data.Subset(aug_dataset, aug_indices),
+        batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0,
+    )
+
+    probs_aug, _, _, _ = run_inference(
+        model, aug_loader, device, threshold=threshold, has_targets=has_targets,
+    )
+    # Layout : (n_aug × N, 2) où block k = pass augmentée k. Moyenne par sample.
+    probs_aug = probs_aug.reshape(n_aug, N, 2).mean(axis=0)
+
+    # 3) Moyenne pondérée
+    probabilities = weight_orig * probs_orig + (1.0 - weight_orig) * probs_aug
+    predictions   = (probabilities >= threshold).astype(int)
+    return probabilities, predictions, true_labels, ids
+
+
 def run_inference(
     model: torch.nn.Module,
     dataloader: DataLoader,
@@ -226,6 +298,10 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.5)
     parser.add_argument('--output', type=str, default='results/')
     parser.add_argument('--no-plot', action='store_true')
+    parser.add_argument('--tta', type=int, default=0,
+                        help="N passes Test-Time Augmentation (0 = désactivé)")
+    parser.add_argument('--tta-weight-orig', type=float, default=0.3,
+                        help="Poids de la passe originale dans la moyenne TTA")
     args = parser.parse_args()
 
     device     = torch.device(
@@ -334,15 +410,31 @@ def main():
     print(f"   - Paramètres totaux       : {total_params:,}")
     print(f"   - Paramètres entraînables : {trainable_params:,}")
 
-    # ── Inférence ─────────────────────────────────────────────────────────────
-    print("\n[INFERENCE] Inférence en cours...")
-    probabilities, predictions, true_labels, ids = run_inference(
-        model       = model,
-        dataloader  = dataloader,
-        device      = device,
-        threshold   = args.threshold,
-        has_targets = has_targets,
-    )
+    # ── Inférence (avec ou sans TTA) ──────────────────────────────────────────
+    if args.tta and args.tta > 0:
+        print(f"\n[INFERENCE] TTA activé : 1 pass original + {args.tta} pass augmentées "
+              f"(weight_orig={args.tta_weight_orig})")
+        probabilities, predictions, true_labels, ids = run_inference_tta(
+            model        = model,
+            raw_spectra  = spectra_np,
+            aux_df       = aux_df,
+            targets_df   = targets_df,
+            base_dataset = dataset,
+            device       = device,
+            n_aug        = args.tta,
+            batch_size   = args.batch_size,
+            threshold    = args.threshold,
+            weight_orig  = args.tta_weight_orig,
+        )
+    else:
+        print("\n[INFERENCE] Inférence en cours...")
+        probabilities, predictions, true_labels, ids = run_inference(
+            model       = model,
+            dataloader  = dataloader,
+            device      = device,
+            threshold   = args.threshold,
+            has_targets = has_targets,
+        )
     print(f"   [OK] Inférence terminée sur {len(ids)} exemples")
 
     df_results = save_predictions(ids, probabilities, predictions, output_dir, true_labels)
