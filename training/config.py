@@ -28,6 +28,15 @@ class ModelConfig:
     pca_components: int = 50
     use_statistical_features: bool = True
     use_diff_features: bool = False
+    n_estimators: int = 1000
+    num_leaves: int = 31
+    max_depth: int = -1
+    min_child_samples: int = 20
+    subsample: float = 0.9
+    colsample_bytree: float = 0.9
+    reg_alpha: float = 0.0
+    reg_lambda: float = 1.0
+    class_weight: Optional[str] = 'balanced'
 
     # Commun
     auxiliary_dim: int = 5
