@@ -25,6 +25,7 @@ Exemple sans targets (prédictions seulement):
 import argparse
 import json
 import pickle
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -284,13 +285,13 @@ def save_predictions(
     """Sauvegarde les prédictions dans inference_res.csv."""
     df = pd.DataFrame({
         'id':         ids,
-        'prob_eau':   probabilities[:, 0],
-        'prob_nuage': probabilities[:, 1],
         'pred_eau':   predictions[:, 0],
         'pred_nuage': predictions[:, 1],
     })
 
     if true_labels is not None:
+        df.insert(1, 'prob_eau',   probabilities[:, 0])
+        df.insert(2, 'prob_nuage', probabilities[:, 1])
         df['true_eau']      = true_labels[:, 0]
         df['true_nuage']    = true_labels[:, 1]
         df['correct_eau']   = (df['pred_eau']   == df['true_eau']).astype(int)
@@ -299,7 +300,7 @@ def save_predictions(
             (df['correct_eau'] == 1) & (df['correct_nuage'] == 1)
         ).astype(int)
 
-    output_path = output_dir / 'inference_res.csv'
+    output_path = output_dir / f"inference_res_{datetime.now():%Y-%m-%d}.csv"
     df.to_csv(output_path, index=False)
     print(f"[SAVE] Predictions sauvegardées : {output_path}")
     return df
@@ -349,14 +350,45 @@ def _build_torch_model(model_type: str, checkpoint: dict, channels: int,
     )
 
 
+def load_lightgbm_artifact(checkpoint_path: str) -> dict:
+    with open(checkpoint_path, 'rb') as f:
+        return pickle.load(f)
+
+
+def build_lightgbm_dataset(
+    artifact: dict,
+    spectra_np: np.ndarray,
+    aux_df: pd.DataFrame,
+    targets_df: Optional[pd.DataFrame],
+) -> ExoplanetDataset:
+    """Reconstruit le dataset d'inférence en réutilisant les stats du train sauvegardées."""
+    aux_mean     = artifact.get('aux_mean')
+    aux_std      = artifact.get('aux_std')
+    spectra_mean = artifact.get('spectra_mean')
+    spectra_std  = artifact.get('spectra_std')
+
+    if any(s is None for s in (aux_mean, aux_std, spectra_mean, spectra_std)):
+        print("   [WARNING] Stats train absentes du checkpoint LightGBM : "
+              "recalcul sur le split d'inférence (résultats potentiellement dégradés).")
+
+    return ExoplanetDataset(
+        spectra              = spectra_np,
+        auxiliary_df         = aux_df,
+        targets_df           = targets_df,
+        is_train             = False,
+        augmentation_factor  = 0,
+        aux_mean             = aux_mean,
+        aux_std              = aux_std,
+        spectra_mean         = spectra_mean,
+        spectra_std          = spectra_std,
+    )
+
+
 def run_lightgbm_inference(
-    checkpoint_path: str,
+    artifact: dict,
     dataset: ExoplanetDataset,
     threshold: float,
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
-    with open(checkpoint_path, 'rb') as f:
-        artifact = pickle.load(f)
-
     cfg = Config.from_dict(artifact['config'])
     features, labels, ids, feature_names = _build_tabular_features(dataset, cfg)
 
@@ -435,36 +467,42 @@ def main():
     aux_df     = pd.read_csv(args.auxiliary)
     targets_df = pd.read_csv(args.targets) if has_targets else None
 
-    dataset = ExoplanetDataset(
-        spectra              = spectra_np,
-        auxiliary_df         = aux_df,
-        targets_df           = targets_df,
-        is_train             = False,
-        augmentation_factor  = 0,
-        aux_mean             = None,
-        aux_std              = None,
-    )
-    print(f"   [OK] {len(dataset)} exemples chargés")
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size  = args.batch_size,
-        shuffle     = False,
-        collate_fn  = collate_fn,
-        num_workers = 0,
-    )
+    is_lightgbm = Path(args.checkpoint).suffix == '.pkl'
 
     # ── Chargement du checkpoint + inférence ─────────────────────────────────
     print("\n[LOAD] Chargement du checkpoint...")
-    if Path(args.checkpoint).suffix == '.pkl':
+    if is_lightgbm:
         print("   - Type de modèle détecté : LIGHTGBM")
+        artifact = load_lightgbm_artifact(args.checkpoint)
+        dataset = build_lightgbm_dataset(artifact, spectra_np, aux_df, targets_df)
+        print(f"   [OK] {len(dataset)} exemples chargés")
+
         print("\n[INFERENCE] Inférence LightGBM en cours...")
         probabilities, predictions, true_labels, ids = run_lightgbm_inference(
-            args.checkpoint,
+            artifact,
             dataset,
             args.threshold,
         )
     else:
+        dataset = ExoplanetDataset(
+            spectra              = spectra_np,
+            auxiliary_df         = aux_df,
+            targets_df           = targets_df,
+            is_train             = False,
+            augmentation_factor  = 0,
+            aux_mean             = None,
+            aux_std              = None,
+        )
+        print(f"   [OK] {len(dataset)} exemples chargés")
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size  = args.batch_size,
+            shuffle     = False,
+            collate_fn  = collate_fn,
+            num_workers = 0,
+        )
+
         checkpoint  = load_checkpoint(args.checkpoint, str(device))
         state_dict  = checkpoint.get('model_state_dict', checkpoint)
         state_dict  = remove_module_prefix(state_dict)

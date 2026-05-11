@@ -362,6 +362,10 @@ class LightGBMTrainer:
             "feature_names": self.feature_names,
             "config": self.config.to_dict(),
             "best_metrics": best_metrics,
+            "aux_mean": self.train_dataset.aux_mean,
+            "aux_std": self.train_dataset.aux_std,
+            "spectra_mean": self.train_dataset.spectra_mean,
+            "spectra_std": self.train_dataset.spectra_std,
         }
         with open(model_dir / f"{self.config.paths.model_basename}best.pkl", "wb") as f:
             pickle.dump(artifact, f)
@@ -536,4 +540,6 @@ class LightGBMTrainer:
             "val_probs": val_probs,
             "val_labels": y_val,
             "val_ids": val_ids,
+            "train_probs": train_probs,
+            "train_labels": y_train,
         }

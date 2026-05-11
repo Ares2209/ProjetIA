@@ -17,3 +17,81 @@
 07:53:59 | INFO    |                    FN     5 | TN   291
 07:53:59 | INFO    | Probabilistes :  AUROC 0.9890  |  AUPRC 0.9774  |  Brier 0.0200
 
+
+
+
+>> Trial 0068 | obj(val_mcc_min_mean)=0.7769  | eau val=0.839 (gap +0.161) | nuage val=0.777 (gap +0.223)
+[I 2026-05-11 15:01:30,106] Trial 68 finished with value: 0.7769498254552741 and parameters: {'learning_rate': 0.046186673518209376, 'num_leaves': 162, 'max_depth': 0, 'min_child_samples': 18, 'subsample': 0.7133382899360177, 'colsample_bytree': 0.8645967500920643, 'reg_alpha': 0.008635352223239127, 'reg_lambda': 2.2734005467273464e-05, 'use_pca': True, 'use_statistical_features': False, 'use_diff_features': False, 'pca_components': 150}. Best is trial 42 with value: 0.7844708426648679.
+
+Optimal Parameters (selon objectif) :
+{
+  "learning_rate": 0.03813407421105035,
+  "num_leaves": 245,
+  "max_depth": -1,
+  "min_child_samples": 15,
+  "subsample": 0.7828288824025794,
+  "colsample_bytree": 0.9798897232917242,
+  "reg_alpha": 0.0006257733263339652,
+  "reg_lambda": 0.0192137877377806,
+  "use_pca": true,
+  "use_statistical_features": false,
+  "use_diff_features": false,
+  "pca_components": 150
+}
+
+Best val_mcc_min_mean: 0.7845
+
+==========================================================================================
+ANALYSE PAR LABEL
+==========================================================================================
+
+Best balanced (mean) — trial #12
+  val MCC eau    : 0.8419 (gap +0.1581, train 1.0000)
+  val MCC nuage  : 0.7834 (gap +0.2166, train 1.0000)
+  val MCC mean   : 0.8127
+  params clés    : {'learning_rate': 0.02171223025831388, 'num_leaves': 254, 'max_depth': -1, 'min_child_samples': 6, 'reg_alpha': 0.0220153993667106, 'reg_lambda': 0.003403359054597097}
+
+Best eau seul — trial #44
+  val MCC eau    : 0.8495 (gap +0.1505, train 1.0000)
+  val MCC nuage  : 0.7658 (gap +0.2342, train 1.0000)
+  val MCC mean   : 0.8077
+  params clés    : {'learning_rate': 0.10127359593449364, 'num_leaves': 202, 'max_depth': -1, 'min_child_samples': 26, 'reg_alpha': 0.0006562842468555447, 'reg_lambda': 0.021221699942249938}
+
+Best nuage seul — trial #26
+  val MCC eau    : 0.6569 (gap +0.3399, train 0.9967)
+  val MCC nuage  : 0.9313 (gap +0.0665, train 0.9978)
+  val MCC mean   : 0.7941
+  params clés    : {'learning_rate': 0.010645167927767906, 'num_leaves': 228, 'max_depth': 0, 'min_child_samples': 18, 'reg_alpha': 5.8543514227717873e-05, 'reg_lambda': 0.00018885076903903456}
+
+Best worst-label (min) — trial #42
+  val MCC eau    : 0.8387 (gap +0.1613, train 1.0000)
+  val MCC nuage  : 0.7845 (gap +0.2155, train 1.0000)
+  val MCC mean   : 0.8116
+  params clés    : {'learning_rate': 0.03813407421105035, 'num_leaves': 245, 'max_depth': -1, 'min_child_samples': 15, 'reg_alpha': 0.0006257733263339652, 'reg_lambda': 0.0192137877377806}
+
+------------------------------------------------------------------------------------------
+Stats sur 69 trials complétés :
+  val MCC eau    : moy 0.5893 ± 0.2871  (min -0.0206, max 0.8495)
+  val MCC nuage  : moy 0.4943 ± 0.2857  (min 0.0000, max 0.9313)
+  gap train-val eau   : moy +0.1368 ± 0.2533
+  gap train-val nuage : moy +0.2211 ± 0.1599
+==========================================================================================
+
+Importance des hyperparamètres sur MCC eau (top 5) :
+  min_child_samples              0.2825
+  max_depth                      0.1924
+  num_leaves                     0.0976
+  use_pca                        0.0934
+  subsample                      0.0892
+
+Importance des hyperparamètres sur MCC nuage (top 5) :
+  max_depth                      0.4712
+  num_leaves                     0.1398
+  min_child_samples              0.0997
+  use_pca                        0.0953
+  subsample                      0.0635
+
+Study saved to:        results/optuna_lightgbm/optuna_study.pkl
+Best params saved to:  results/optuna_lightgbm/best_params.json
+Analysis saved to:     results/optuna_lightgbm/analysis.json
+Trials CSV saved to:   results/optuna_lightgbm/trials.csv

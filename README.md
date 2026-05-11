@@ -170,3 +170,21 @@ Canaux SNR dérivés	Moyen	Faible
 K-fold ensemble	Élevé	Moyen
 Seuil par classe	Faible-moyen	Faible
 Le point 1 est le correctif le plus immédiat car l'augmentation est configurée mais jamais exécutée.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
