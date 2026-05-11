@@ -1,4 +1,4 @@
-"""Configuration spécifique au modèle LightGBM."""
+"""Configuration specific to the LightGBM model."""
 
 from training.config import (
     Config,
@@ -12,26 +12,39 @@ MODEL_DIR = "models/LightGBM"
 
 
 def get_config() -> Config:
-    """Retourne la configuration complète pour entraîner LightGBM."""
+    """Return the complete configuration for LightGBM training."""
     return Config(
         model=ModelConfig(
             architecture="LightGBM",
-            spectrum_length=283,
-            auxiliary_dim=5,
-            use_gpu=False,  # LightGBM peut utiliser GPU mais commençons par CPU
-            random_state=42,
+            input_channels=5,
+            auxiliary_dim=21,
+            use_pca=False,
+            pca_components=50,
+            use_statistical_features=True,
+            use_diff_features=True,
+            n_estimators=1000,
+            num_leaves=31,
+            max_depth=-1,
+            min_child_samples=20,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.0,
+            reg_lambda=1.0,
+            class_weight="balanced",
         ),
         training=TrainingConfig(
             num_classes=2,
-            batch_size=32,  # Non utilisé par LightGBM mais gardé pour compatibilité
-            num_epochs=1,   # LightGBM gère ses propres itérations
-            learning_rate=0.1,
-            patience=20,    # early_stopping_rounds
-            weight_decay=0.0,  # Non utilisé par LightGBM
-            label_smoothing=0.0,  # Non utilisé par LightGBM
+            batch_size=32,
+            num_epochs=1,
+            learning_rate=0.03,
+            patience=50,
             classification_threshold=0.5,
         ),
-        data=DataConfig(),
+        data=DataConfig(
+            augmentation_factor=0,
+            num_workers=0,
+            pin_memory=False,
+        ),
         paths=PathsConfig(
             model_folder=f"{MODEL_DIR}/checkpoints",
             model_basename="lightgbm_model",

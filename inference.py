@@ -24,22 +24,26 @@ Exemple sans targets (prédictions seulement):
 """
 import argparse
 import json
+import pickle
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, f1_score
 import matplotlib.pyplot as plt
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
 
 from models.CNN import CNN
-from models.ResNetCNN import ResNet1D
+from models.LightGBM.LightGBM import LABEL_NAMES, _as_frame, _build_tabular_features
+from models.ResNetCNN import ResNet1D, ensemble_resnet_1d, resnet8_1d, resnet18_1d, resnet34_1d
 from models.dataset import ExoplanetDataset, collate_fn
-from training.config import get_config_object
+from training.config import Config, get_config_object
 
 
 def remove_module_prefix(state_dict: dict) -> dict:
@@ -54,6 +58,8 @@ def remove_module_prefix(state_dict: dict) -> dict:
 def detect_model_class(state_dict: dict) -> str:
     """Detecte la famille de modèle à partir des clés du state dict."""
     keys = list(state_dict.keys())
+    if any(k.startswith('resnet8.') or k.startswith('resnet18.') for k in keys):
+        return 'ensemble_resnet'
     if any(k.startswith('stem.') or 'stage' in k for k in keys):
         return 'resnet'
     return 'cnn'
@@ -83,26 +89,42 @@ def plot_confusion_matrices(
     """Affiche et sauvegarde les matrices de confusion."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    sns.heatmap(
-        cm_eau,
-        annot=True, fmt='d', cmap='Blues',
-        xticklabels=['Absent', 'Présent'],
-        yticklabels=['Absent', 'Présent'],
-        ax=axes[0],
-        cbar_kws={'label': 'Nombre d\'échantillons'}
-    )
+    if sns is not None:
+        sns.heatmap(
+            cm_eau,
+            annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Absent', 'Présent'],
+            yticklabels=['Absent', 'Présent'],
+            ax=axes[0],
+            cbar_kws={'label': 'Nombre d\'échantillons'}
+        )
+    else:
+        axes[0].imshow(cm_eau, cmap='Blues')
+        for i in range(cm_eau.shape[0]):
+            for j in range(cm_eau.shape[1]):
+                axes[0].text(j, i, str(cm_eau[i, j]), ha='center', va='center')
+        axes[0].set_xticks([0, 1], ['Absent', 'Présent'])
+        axes[0].set_yticks([0, 1], ['Absent', 'Présent'])
     axes[0].set_title(f'Matrice de Confusion - EAU{title_suffix}')
     axes[0].set_ylabel('Vérité Terrain')
     axes[0].set_xlabel('Prédiction')
 
-    sns.heatmap(
-        cm_nuage,
-        annot=True, fmt='d', cmap='Oranges',
-        xticklabels=['Absent', 'Présent'],
-        yticklabels=['Absent', 'Présent'],
-        ax=axes[1],
-        cbar_kws={'label': 'Nombre d\'échantillons'}
-    )
+    if sns is not None:
+        sns.heatmap(
+            cm_nuage,
+            annot=True, fmt='d', cmap='Oranges',
+            xticklabels=['Absent', 'Présent'],
+            yticklabels=['Absent', 'Présent'],
+            ax=axes[1],
+            cbar_kws={'label': 'Nombre d\'échantillons'}
+        )
+    else:
+        axes[1].imshow(cm_nuage, cmap='Oranges')
+        for i in range(cm_nuage.shape[0]):
+            for j in range(cm_nuage.shape[1]):
+                axes[1].text(j, i, str(cm_nuage[i, j]), ha='center', va='center')
+        axes[1].set_xticks([0, 1], ['Absent', 'Présent'])
+        axes[1].set_yticks([0, 1], ['Absent', 'Présent'])
     axes[1].set_title(f'Matrice de Confusion - NUAGES{title_suffix}')
     axes[1].set_ylabel('Vérité Terrain')
     axes[1].set_xlabel('Prédiction')
@@ -262,8 +284,8 @@ def save_predictions(
     """Sauvegarde les prédictions dans inference_res.csv."""
     df = pd.DataFrame({
         'id':         ids,
-        #'prob_eau':   probabilities[:, 0],
-        #'prob_nuage': probabilities[:, 1],
+        'prob_eau':   probabilities[:, 0],
+        'prob_nuage': probabilities[:, 1],
         'pred_eau':   predictions[:, 0],
         'pred_nuage': predictions[:, 1],
     })
@@ -283,10 +305,82 @@ def save_predictions(
     return df
 
 
+def _config_from_checkpoint(checkpoint: dict) -> Config:
+    cfg_dict = checkpoint.get('config')
+    if cfg_dict:
+        return Config.from_dict(cfg_dict)
+    return get_config_object()
+
+
+def _build_torch_model(model_type: str, checkpoint: dict, channels: int,
+                       length: int, auxiliary_dim: int):
+    cfg = _config_from_checkpoint(checkpoint)
+    model_cfg = cfg.model
+    architecture = getattr(model_cfg, 'architecture', '')
+    dropout = getattr(model_cfg, 'dropout', 0.3)
+
+    if model_type == 'ensemble_resnet' or architecture == '2ResNet':
+        return ensemble_resnet_1d(
+            spectrum_length=length,
+            auxiliary_dim=auxiliary_dim,
+            num_classes=2,
+            input_channels=channels,
+            dropout=dropout,
+        )
+
+    if model_type == 'resnet':
+        if architecture == 'ResNet8':
+            return resnet8_1d(length, auxiliary_dim, 2, channels, dropout=dropout)
+        if architecture == 'ResNet34':
+            return resnet34_1d(length, auxiliary_dim, 2, channels, dropout=dropout)
+        return resnet18_1d(length, auxiliary_dim, 2, channels, dropout=dropout)
+
+    return CNN(
+        spectrum_length=length,
+        auxiliary_dim=auxiliary_dim,
+        num_classes=2,
+        input_channels=channels,
+        conv_channels=getattr(model_cfg, 'conv_channels', [32, 64, 128, 256]),
+        kernel_sizes=getattr(model_cfg, 'kernel_sizes', [7, 5, 3, 3]),
+        pool_sizes=getattr(model_cfg, 'pool_sizes', [2, 2, 2, 2]),
+        fc_dims=getattr(model_cfg, 'fc_dims', [256, 128]),
+        dropout=dropout,
+        use_batch_norm=getattr(model_cfg, 'use_batch_norm', True),
+    )
+
+
+def run_lightgbm_inference(
+    checkpoint_path: str,
+    dataset: ExoplanetDataset,
+    threshold: float,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
+    with open(checkpoint_path, 'rb') as f:
+        artifact = pickle.load(f)
+
+    cfg = Config.from_dict(artifact['config'])
+    features, labels, ids, feature_names = _build_tabular_features(dataset, cfg)
+
+    pca = artifact.get('pca')
+    if pca is not None:
+        features = pca.transform(features)
+        feature_names = artifact['feature_names']
+
+    if feature_names != artifact['feature_names']:
+        raise RuntimeError("Features d'inférence incompatibles avec le checkpoint LightGBM.")
+
+    frame = _as_frame(features, artifact['feature_names'])
+    probabilities = np.zeros((features.shape[0], len(LABEL_NAMES)), dtype=np.float32)
+    for idx, label_name in enumerate(LABEL_NAMES):
+        probabilities[:, idx] = artifact['models'][label_name].predict_proba(frame)[:, 1]
+
+    predictions = (probabilities >= threshold).astype(int)
+    return probabilities, predictions, labels, ids
+
+
 def main():
     parser = argparse.ArgumentParser(description='Inference script with confusion matrix')
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Chemin vers le checkpoint .pth')
+                        help='Chemin vers le checkpoint .pth ou .pkl')
     parser.add_argument('--spectra', type=str,
                         default='Défi-IA-2026/DATA/defi-ia-cnes/spectra.npy')
     parser.add_argument('--auxiliary', type=str,
@@ -360,81 +454,69 @@ def main():
         num_workers = 0,
     )
 
-    # ── Chargement du checkpoint ──────────────────────────────────────────────
+    # ── Chargement du checkpoint + inférence ─────────────────────────────────
     print("\n[LOAD] Chargement du checkpoint...")
-    checkpoint  = load_checkpoint(args.checkpoint, str(device))
-    state_dict  = checkpoint.get('model_state_dict', checkpoint)
-    state_dict  = remove_module_prefix(state_dict)
-    model_type  = detect_model_class(state_dict)
-    print(f"   - Type de modèle détecté : {model_type.upper()}")
-
-    # Inférer les dimensions depuis un batch
-    sample_batch = next(iter(dataloader))
-    spectrum, auxiliary = sample_batch[0], sample_batch[1]
-    _, channels, length = spectrum.shape
-    auxiliary_dim       = auxiliary.shape[1]
-
-    # ── Instanciation du modèle ───────────────────────────────────────────────
-    cfg = get_config_object()
-
-    if model_type.lower() == 'resnet':
-        model = ResNet1D(
-            spectrum_length = length,
-            auxiliary_dim   = auxiliary_dim,
-            num_classes     = 2,
-            input_channels  = channels,
-            block_type      = 'basic',
-            num_blocks      = [2, 2, 2, 2],
-            base_channels   = 64,
-            dropout         = cfg.model.dropout,
+    if Path(args.checkpoint).suffix == '.pkl':
+        print("   - Type de modèle détecté : LIGHTGBM")
+        print("\n[INFERENCE] Inférence LightGBM en cours...")
+        probabilities, predictions, true_labels, ids = run_lightgbm_inference(
+            args.checkpoint,
+            dataset,
+            args.threshold,
         )
     else:
-        model = CNN(
-            spectrum_length = length,
-            auxiliary_dim   = auxiliary_dim,
-            num_classes     = 2,
-            input_channels  = channels,
-        )
+        checkpoint  = load_checkpoint(args.checkpoint, str(device))
+        state_dict  = checkpoint.get('model_state_dict', checkpoint)
+        state_dict  = remove_module_prefix(state_dict)
+        model_type  = detect_model_class(state_dict)
+        print(f"   - Type de modèle détecté : {model_type.upper()}")
 
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print("   [OK] Poids chargés (strict)")
-    except RuntimeError:
-        model.load_state_dict(state_dict, strict=False)
-        print("   [WARNING] Poids chargés (non-strict)")
+        # Inférer les dimensions depuis un batch
+        sample_batch = next(iter(dataloader))
+        spectrum, auxiliary = sample_batch[0], sample_batch[1]
+        _, channels, length = spectrum.shape
+        auxiliary_dim       = auxiliary.shape[1]
 
-    model = model.to(device)
+        model = _build_torch_model(model_type, checkpoint, channels, length, auxiliary_dim)
+        try:
+            model.load_state_dict(state_dict, strict=True)
+            print("   [OK] Poids chargés (strict)")
+        except RuntimeError:
+            model.load_state_dict(state_dict, strict=False)
+            print("   [WARNING] Poids chargés (non-strict)")
 
-    total_params     = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"   - Paramètres totaux       : {total_params:,}")
-    print(f"   - Paramètres entraînables : {trainable_params:,}")
+        model = model.to(device)
 
-    # ── Inférence (avec ou sans TTA) ──────────────────────────────────────────
-    if args.tta and args.tta > 0:
-        print(f"\n[INFERENCE] TTA activé : 1 pass original + {args.tta} pass augmentées "
-              f"(weight_orig={args.tta_weight_orig})")
-        probabilities, predictions, true_labels, ids = run_inference_tta(
-            model        = model,
-            raw_spectra  = spectra_np,
-            aux_df       = aux_df,
-            targets_df   = targets_df,
-            base_dataset = dataset,
-            device       = device,
-            n_aug        = args.tta,
-            batch_size   = args.batch_size,
-            threshold    = args.threshold,
-            weight_orig  = args.tta_weight_orig,
-        )
-    else:
-        print("\n[INFERENCE] Inférence en cours...")
-        probabilities, predictions, true_labels, ids = run_inference(
-            model       = model,
-            dataloader  = dataloader,
-            device      = device,
-            threshold   = args.threshold,
-            has_targets = has_targets,
-        )
+        total_params     = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"   - Paramètres totaux       : {total_params:,}")
+        print(f"   - Paramètres entraînables : {trainable_params:,}")
+
+        # ── Inférence PyTorch (avec ou sans TTA) ──────────────────────────────
+        if args.tta and args.tta > 0:
+            print(f"\n[INFERENCE] TTA activé : 1 pass original + {args.tta} pass augmentées "
+                  f"(weight_orig={args.tta_weight_orig})")
+            probabilities, predictions, true_labels, ids = run_inference_tta(
+                model        = model,
+                raw_spectra  = spectra_np,
+                aux_df       = aux_df,
+                targets_df   = targets_df,
+                base_dataset = dataset,
+                device       = device,
+                n_aug        = args.tta,
+                batch_size   = args.batch_size,
+                threshold    = args.threshold,
+                weight_orig  = args.tta_weight_orig,
+            )
+        else:
+            print("\n[INFERENCE] Inférence en cours...")
+            probabilities, predictions, true_labels, ids = run_inference(
+                model       = model,
+                dataloader  = dataloader,
+                device      = device,
+                threshold   = args.threshold,
+                has_targets = has_targets,
+            )
     print(f"   [OK] Inférence terminée sur {len(ids)} exemples")
 
     df_results = save_predictions(ids, probabilities, predictions, output_dir, true_labels)

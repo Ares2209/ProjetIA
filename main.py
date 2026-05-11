@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Script d'entraînement principal.
 
-Usage: python main.py [--arch CNN|ResNetCNN|XGBoost] [--config PATH]
+Usage: python main.py [--arch CNN|ResNetCNN|LightGBM|XGBoost] [--config PATH]
 """
 import argparse
 import importlib
@@ -27,6 +27,7 @@ from training.utils import (
 from training.plot import plot_training_results
 from models.dataset import ExoplanetDataset, collate_fn, seed_worker
 from models.CNN import CNN
+from models.LightGBM import LightGBMTrainer
 from models.ResNetCNN import ResNet1D, resnet18_1d, resnet34_1d, resnet8_1d, ensemble_resnet_1d
 
 
@@ -39,6 +40,7 @@ ARCH_TO_CONFIG = {
     'ResNet18':  'models.ResNetCNN.config',
     'ResNet34':  'models.ResNetCNN.config',
     'ResNetCNN': 'models.ResNetCNN.config',
+    'LightGBM':  'models.LightGBM.config',
     'XGBoost':   'models.XGBoost.config',
     'LightGBM':  'models.LightGBM.config',
 }
@@ -208,15 +210,30 @@ def build_model(cfg, spectrum_length: int, auxiliary_dim: int):
         logger.info("Architecture : Ensemble SE-ResNet8 + ResNet18")
         return ensemble_resnet_1d(**common_torch)
 
+    elif arch == "LightGBM":
+        logger.info("Architecture : LightGBM")
+        return None
+
+    elif arch == "XGBoost":
+        raise NotImplementedError(
+            "XGBoost n'est pas encore implémenté dans ce dépôt et le package "
+            "'xgboost' n'est pas installé. Utilise --arch LightGBM pour le "
+            "baseline gradient boosting disponible."
+        )
+
     else:
         raise ValueError(
             f"Architecture inconnue : '{arch}'. "
-            f"Valeurs valides : CNN | ResNet8 | ResNet18 | ResNet34 | 2ResNet"
+            f"Valeurs valides : CNN | ResNet8 | ResNet18 | ResNet34 | 2ResNet | LightGBM"
         )
 
 
 def _select_trainer(model, train_loader, val_loader, cfg):
     """Retourne le Trainer PyTorch."""
+    if cfg.model.architecture == "LightGBM":
+        logger.info("Trainer : LightGBMTrainer")
+        return LightGBMTrainer(train_loader, val_loader, cfg)
+
     logger.info("Trainer : Trainer (PyTorch)")
     return Trainer(model, train_loader, val_loader, cfg)
 
