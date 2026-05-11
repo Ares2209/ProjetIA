@@ -35,8 +35,12 @@ logger = logging.getLogger(__name__)
 
 ARCH_TO_CONFIG = {
     'CNN':       'models.CNN.config',
+    'ResNet8':   'models.ResNetCNN.config',
+    'ResNet18':  'models.ResNetCNN.config',
+    'ResNet34':  'models.ResNetCNN.config',
     'ResNetCNN': 'models.ResNetCNN.config',
     'XGBoost':   'models.XGBoost.config',
+    'LightGBM':  'models.LightGBM.config',
 }
 
 

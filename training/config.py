@@ -28,6 +28,8 @@ class ModelConfig:
     pca_components: int = 50
     use_statistical_features: bool = True
     use_diff_features: bool = False
+    use_gpu: bool = False
+    random_state: int = 42
 
     # Commun
     auxiliary_dim: int = 5
