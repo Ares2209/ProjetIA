@@ -143,11 +143,17 @@ def cross_validate(
             trainer = _select_trainer(model, train_loader, val_loader, fold_cfg)
             result = trainer.train()
 
-            # OOF predictions sur ce fold avec le best checkpoint
-            best_path = Path(fold_cfg.paths.model_folder) / f"{fold_cfg.paths.model_basename}best.pth"
-            fold_probs, fold_labels = _predict_dataset(
-                model, val_loader, fold_cfg.device, best_path,
-            )
+            # OOF predictions : si le trainer a déjà calculé val_probs/val_labels
+            # (cas LightGBM), on les utilise directement ; sinon on charge le
+            # best checkpoint et on infère via torch (cas PyTorch).
+            if "val_probs" in result and "val_labels" in result:
+                fold_probs = np.asarray(result["val_probs"], dtype=np.float32)
+                fold_labels = np.asarray(result["val_labels"], dtype=np.float32)
+            else:
+                best_path = Path(fold_cfg.paths.model_folder) / f"{fold_cfg.paths.model_basename}best.pth"
+                fold_probs, fold_labels = _predict_dataset(
+                    model, val_loader, fold_cfg.device, best_path,
+                )
             oof_probs[val_idx]  += fold_probs
             oof_labels[val_idx]  = fold_labels
             oof_count[val_idx]  += 1

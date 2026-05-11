@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -41,28 +42,36 @@ def _safe_feature_names(n_channels: int) -> Tuple[str, ...]:
     return CHANNEL_NAMES + extra
 
 
-def _targets_from_dataset(dataset) -> np.ndarray:
-    if dataset.targets is None:
-        raise ValueError("LightGBM training requires targets in the dataset.")
-    return dataset.targets.loc[:, LABEL_NAMES].to_numpy(dtype=np.int64)
-
-
-def _ids_from_dataset(dataset) -> np.ndarray:
-    if dataset.targets is not None and "id" in dataset.targets.columns:
-        return dataset.targets["id"].to_numpy()
-    return np.arange(dataset.original_size)
-
-
 def _build_tabular_features(dataset, cfg) -> Tuple[np.ndarray, np.ndarray | None, np.ndarray, List[str]]:
-    """Build a tabular matrix from normalized spectra and auxiliary features."""
-    # Reproduit la pipeline de __getitem__ (add_derived_channels + normalisation
-    # avec les stats globales) sans l'augmentation, pour obtenir un (N, 52, 5).
-    raw = dataset.raw_spectra[:dataset.original_size]
-    spectra = type(dataset)._add_derived_channels(raw)
-    spectra = ((spectra - dataset.spectra_mean) / dataset.spectra_std).astype(np.float32)
-    auxiliary = dataset.aux_features[:dataset.original_size].astype(np.float32)
-    labels = _targets_from_dataset(dataset) if dataset.targets is not None else None
-    ids = _ids_from_dataset(dataset)
+    """Build a tabular matrix by iterating __getitem__ (applies augmentation when active)."""
+    # Seed RNG so augmented samples are reproducible across runs.
+    seed = int(cfg.data.random_seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    has_targets = dataset.targets is not None
+    n_total = len(dataset)
+
+    spectra_buf: List[np.ndarray] = []
+    aux_buf: List[np.ndarray] = []
+    labels_buf: List[np.ndarray] = [] if has_targets else []
+    ids_buf: List[int] = []
+
+    for i in range(n_total):
+        item = dataset[i]
+        spec = item["spectrum"]
+        aux = item["auxiliary"]
+        spectra_buf.append(spec.numpy() if hasattr(spec, "numpy") else np.asarray(spec))
+        aux_buf.append(aux.numpy() if hasattr(aux, "numpy") else np.asarray(aux))
+        ids_buf.append(int(item["id"]))
+        if has_targets:
+            tgt = item["target"]
+            labels_buf.append(tgt.numpy() if hasattr(tgt, "numpy") else np.asarray(tgt))
+
+    spectra = np.stack(spectra_buf).astype(np.float32)
+    auxiliary = np.stack(aux_buf).astype(np.float32)
+    labels = np.stack(labels_buf).astype(np.int64) if has_targets else None
+    ids = np.asarray(ids_buf)
 
     n_samples, n_positions, n_channels = spectra.shape
     channel_names = _safe_feature_names(n_channels)
@@ -208,27 +217,99 @@ def _find_optimal_threshold(labels: np.ndarray, probs: np.ndarray) -> Tuple[floa
     return best_threshold, float(best_mcc)
 
 
-def _history(train: Dict[str, float], val: Dict[str, float]) -> Dict[str, List[float]]:
-    keys = [
-        "loss", "accuracy", "balanced_accuracy", "precision", "recall",
-        "specificity", "f1", "f2", "iou", "mcc", "cohen_kappa",
-        "class_0_precision", "class_0_recall", "class_1_precision",
-        "class_1_recall", "support_class_0", "support_class_1",
-        "auroc", "auprc", "brier_score", "tp", "fp", "tn", "fn",
-        "composite_score", "g_mean",
-    ]
-    result: Dict[str, List[float]] = {"iteration_losses": []}
-    for key in keys:
-        result[f"train_{key}"] = [train[key]]
-        result[f"val_{key}"] = [val[key]]
+HISTORY_METRIC_KEYS: Tuple[str, ...] = (
+    "loss", "accuracy", "balanced_accuracy", "precision", "recall",
+    "specificity", "f1", "f2", "iou", "mcc", "cohen_kappa",
+    "class_0_precision", "class_0_recall", "class_1_precision",
+    "class_1_recall", "support_class_0", "support_class_1",
+    "auroc", "auprc", "brier_score", "tp", "fp", "tn", "fn",
+    "composite_score", "g_mean",
+)
 
-    for key in (
-        "min_class_recall", "class_balance_gap", "stability_score",
-        "production_score", "f_harmonic", "best_threshold",
-        "mcc_at_best_threshold",
-    ):
-        result[f"val_{key}"] = [val[key]]
-    return result
+VAL_ONLY_KEYS: Tuple[str, ...] = (
+    "min_class_recall", "class_balance_gap", "stability_score",
+    "production_score", "f_harmonic",
+)
+
+
+def _checkpoint_iterations(max_iter: int, n_checkpoints: int = 30) -> List[int]:
+    """Return up to n_checkpoints evenly-spaced iteration indices in [1, max_iter]."""
+    if max_iter <= 1:
+        return [max(1, max_iter)]
+    n = min(n_checkpoints, max_iter)
+    iters = np.linspace(1, max_iter, n).round().astype(int).tolist()
+    # Deduplicate while keeping order.
+    seen: List[int] = []
+    for it in iters:
+        if not seen or it != seen[-1]:
+            seen.append(int(it))
+    return seen
+
+
+def _build_iteration_history(
+    models: Dict[str, "lgb.LGBMClassifier"],
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    x_val: pd.DataFrame,
+    y_val: np.ndarray,
+    threshold: float,
+    primary: int,
+    n_checkpoints: int = 30,
+) -> Tuple[Dict[str, List[float]], List[int]]:
+    """Snapshot metrics across boosting iterations to build an epoch-like history."""
+    label_names = list(models.keys())
+    max_iter = max(
+        (m.best_iteration_ or m.n_estimators_) for m in models.values()
+    )
+    iters = _checkpoint_iterations(max_iter, n_checkpoints)
+
+    history: Dict[str, List[float]] = {"iteration_losses": []}
+    for key in HISTORY_METRIC_KEYS:
+        history[f"train_{key}"] = []
+        history[f"val_{key}"] = []
+    for key in VAL_ONLY_KEYS:
+        history[f"val_{key}"] = []
+
+    # Per-iteration val logloss (averaged across labels) from evals_result_.
+    val_loglosses_per_label: List[np.ndarray] = []
+    for label_name in label_names:
+        evals = models[label_name].evals_result_ or {}
+        val_eval = evals.get("val") or evals.get("valid_0") or {}
+        series = val_eval.get("binary_logloss")
+        if series is not None:
+            val_loglosses_per_label.append(np.asarray(series, dtype=np.float64))
+    if val_loglosses_per_label:
+        min_len = min(arr.shape[0] for arr in val_loglosses_per_label)
+        stacked = np.stack([arr[:min_len] for arr in val_loglosses_per_label])
+        history["iteration_losses"] = stacked.mean(axis=0).tolist()
+
+    n_labels = y_train.shape[1]
+    for it in iters:
+        train_probs = np.zeros_like(y_train, dtype=np.float32)
+        val_probs = np.zeros_like(y_val, dtype=np.float32)
+        for idx, label_name in enumerate(label_names):
+            model = models[label_name]
+            max_for_model = model.best_iteration_ or model.n_estimators_
+            n_used = int(min(it, max_for_model))
+            train_probs[:, idx] = model.predict_proba(x_train, num_iteration=n_used)[:, 1]
+            val_probs[:, idx] = model.predict_proba(x_val, num_iteration=n_used)[:, 1]
+
+        train_m = _metrics_from_probs(y_train[:, primary], train_probs[:, primary], threshold)
+        val_m = _metrics_from_probs(y_val[:, primary], val_probs[:, primary], threshold)
+        train_m["loss"] = float(np.mean([
+            _binary_log_loss(y_train[:, i], train_probs[:, i]) for i in range(n_labels)
+        ]))
+        val_m["loss"] = float(np.mean([
+            _binary_log_loss(y_val[:, i], val_probs[:, i]) for i in range(n_labels)
+        ]))
+
+        for key in HISTORY_METRIC_KEYS:
+            history[f"train_{key}"].append(float(train_m[key]))
+            history[f"val_{key}"].append(float(val_m[key]))
+        for key in VAL_ONLY_KEYS:
+            history[f"val_{key}"].append(float(val_m[key]))
+
+    return history, iters
 
 
 class LightGBMTrainer:
@@ -360,6 +441,7 @@ class LightGBMTrainer:
                 x_train_frame,
                 y_train[:, idx],
                 eval_set=[(x_val_frame, y_val[:, idx])],
+                eval_names=["val"],
                 eval_metric="binary_logloss",
                 callbacks=[
                     lgb.early_stopping(
@@ -374,34 +456,40 @@ class LightGBMTrainer:
             val_probs[:, idx] = model.predict_proba(x_val_frame)[:, 1]
 
         primary = PRIMARY_LABEL_INDEX
+        threshold = self.config.training.classification_threshold
         train_metrics = _metrics_from_probs(
-            y_train[:, primary],
-            train_probs[:, primary],
-            self.config.training.classification_threshold,
+            y_train[:, primary], train_probs[:, primary], threshold,
         )
         val_metrics = _metrics_from_probs(
-            y_val[:, primary],
-            val_probs[:, primary],
-            self.config.training.classification_threshold,
+            y_val[:, primary], val_probs[:, primary], threshold,
         )
 
-        train_metrics["loss"] = np.mean([
+        train_metrics["loss"] = float(np.mean([
             _binary_log_loss(y_train[:, idx], train_probs[:, idx])
             for idx in range(y_train.shape[1])
-        ])
-        val_metrics["loss"] = np.mean([
+        ]))
+        val_metrics["loss"] = float(np.mean([
             _binary_log_loss(y_val[:, idx], val_probs[:, idx])
             for idx in range(y_val.shape[1])
-        ])
+        ]))
 
         best_t, mcc_at_best_t = _find_optimal_threshold(
-            y_val[:, primary],
-            val_probs[:, primary],
+            y_val[:, primary], val_probs[:, primary],
         )
         val_metrics["best_threshold"] = best_t
         val_metrics["mcc_at_best_threshold"] = mcc_at_best_t
 
-        history = _history(train_metrics, val_metrics)
+        history, checkpoint_iters = _build_iteration_history(
+            self.models,
+            x_train_frame, y_train,
+            x_val_frame, y_val,
+            threshold=threshold,
+            primary=primary,
+            n_checkpoints=30,
+        )
+        history["checkpoint_iterations"] = [int(it) for it in checkpoint_iters]
+        history["val_best_threshold"] = [float(best_t)]
+        history["val_mcc_at_best_threshold"] = [float(mcc_at_best_t)]
         best_metrics = {
             "mcc": val_metrics["mcc"],
             "mcc_at_best_threshold": val_metrics["mcc_at_best_threshold"],
@@ -435,12 +523,17 @@ class LightGBMTrainer:
         print(f"  Val AUROC (nuage):  {val_metrics['auroc']:.4f}")
         print("=" * 90 + "\n")
 
+        n_checkpoints_built = len(history.get("val_mcc", []))
+        final_epoch = max(1, n_checkpoints_built)
         return {
             "best_metrics": best_metrics,
-            "best_epoch": 1,
-            "final_epoch": 1,
+            "best_epoch": final_epoch,
+            "final_epoch": final_epoch,
             "training_time": elapsed,
             "early_stopped": False,
             "history": history,
             "best_threshold": best_t,
+            "val_probs": val_probs,
+            "val_labels": y_val,
+            "val_ids": val_ids,
         }

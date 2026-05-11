@@ -16,3 +16,4 @@
 07:53:59 | INFO    | Confusion (Val) :  TP   295 | FP     9
 07:53:59 | INFO    |                    FN     5 | TN   291
 07:53:59 | INFO    | Probabilistes :  AUROC 0.9890  |  AUPRC 0.9774  |  Brier 0.0200
+
