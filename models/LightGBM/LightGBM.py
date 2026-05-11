@@ -55,7 +55,11 @@ def _ids_from_dataset(dataset) -> np.ndarray:
 
 def _build_tabular_features(dataset, cfg) -> Tuple[np.ndarray, np.ndarray | None, np.ndarray, List[str]]:
     """Build a tabular matrix from normalized spectra and auxiliary features."""
-    spectra = dataset.spectra[:dataset.original_size].astype(np.float32)
+    # Reproduit la pipeline de __getitem__ (add_derived_channels + normalisation
+    # avec les stats globales) sans l'augmentation, pour obtenir un (N, 52, 5).
+    raw = dataset.raw_spectra[:dataset.original_size]
+    spectra = type(dataset)._add_derived_channels(raw)
+    spectra = ((spectra - dataset.spectra_mean) / dataset.spectra_std).astype(np.float32)
     auxiliary = dataset.aux_features[:dataset.original_size].astype(np.float32)
     labels = _targets_from_dataset(dataset) if dataset.targets is not None else None
     ids = _ids_from_dataset(dataset)
