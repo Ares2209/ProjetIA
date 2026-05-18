@@ -613,7 +613,7 @@ def main():
         print("="*60)
 
     print(f"\n[INFO] Tous les résultats sont dans : {output_dir}")
-    print(f"[INFO] Fichier principal : {output_dir / 'inference_res.csv'}")
+    print(f"[INFO] Fichier principal : {output_dir / f'inference_res_{datetime.now():%Y-%m-%d}.csv'}")
 
 
 if __name__ == '__main__':
