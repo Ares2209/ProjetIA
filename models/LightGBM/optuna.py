@@ -10,23 +10,23 @@ Usage:
     python -m models.LightGBM.optuna --trials 50 --gap-penalty 0.5
     python -m models.LightGBM.optuna --trials 30 --seeds-per-trial 5 --timeout 7200
 
-Outputs (dans `models/LightGBM/optuna_search/`):
-  - optuna_search           : base SQLite (trials, résumable)
-  - best_params.json        : meilleur trial selon l'objectif
-  - trials.csv              : DataFrame complet pour exploration
-  - analysis.json           : meilleurs par critère + agrégats
+Outputs :
+  - models/LightGBM/optuna_search          : base SQLite (trials, résumable)
+  - models/LightGBM/results/optuna/best_params.json
+  - models/LightGBM/results/optuna/trials.csv
+  - models/LightGBM/results/optuna/analysis.json
   
-# Première recherche (50 trials, ~1h)
+# Première recherche (50 trials, ~1h) 50 trials, 3-fold CV, hold-out 15%
 python -m models.LightGBM.optuna --trials 50
 
-# Reprendre / élargir avec 30 trials de plus dans la même DB
-python -m models.LightGBM.optuna --trials 30
+# Plus rigoureux (5 folds)
+python models/LightGBM/optuna.py --trials 30 --cv-folds 5
 
-# Sans pénalisation du gap (comportement de l'ancien script)
-python -m models.LightGBM.optuna --trials 50 --gap-penalty 0
+# Si tu veux juste itérer rapidement sans le test final
+python models/LightGBM/optuna.py --trials 20 --skip-final-test
 
-# Forcer une recherche plus robuste (5 seeds × trial)
-python -m models.LightGBM.optuna --trials 30 --seeds-per-trial 5 --timeout 7200
+python -m models.LightGBM.optuna --trials 60 --study-name lightgbm_search_v2 --storage-path models/LightGBM/optuna_search_v2
+
   
 """
 
@@ -45,19 +45,46 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import argparse
+import contextlib
+import copy
 import json
+import logging
+import tempfile
 from statistics import mean, pstdev
-from typing import Dict, List
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 from sklearn.metrics import matthews_corrcoef
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
-from main import _select_trainer, build_dataloaders, build_model
+from main import (
+    _select_trainer,
+    build_dataloaders_from_indices,
+    build_model,
+    load_raw_data,
+)
 from models.LightGBM.config import get_config as get_lightgbm_config
 from training.utils import set_seed, setup_logging
+
+
+logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _silence_loggers(names: Tuple[str, ...], level: int = logging.WARNING) -> Iterator[None]:
+    """Élève temporairement le seuil de certains loggers (utile pendant les trials)."""
+    targets = [logging.getLogger(name) for name in names]
+    saved = [lg.level for lg in targets]
+    try:
+        for lg in targets:
+            lg.setLevel(level)
+        yield
+    finally:
+        for lg, lvl in zip(targets, saved):
+            lg.setLevel(lvl)
 
 
 LABEL_NAMES = ("eau", "nuage")
@@ -94,6 +121,9 @@ def _suggest_hyperparams(trial: optuna.Trial) -> dict:
             "use_statistical_features", [False, True]
         ),
         "use_diff_features": trial.suggest_categorical("use_diff_features", [False, True]),
+        "augmentation_factor": trial.suggest_categorical(
+            "augmentation_factor", [0, 2, 4]
+        ),
     }
     if params["use_pca"]:
         params["pca_components"] = trial.suggest_int("pca_components", 20, 150)
@@ -110,6 +140,10 @@ def _apply_params_to_cfg(cfg, params: dict) -> None:
         setattr(cfg.model, key, params[key])
     if params["use_pca"]:
         cfg.model.pca_components = params["pca_components"]
+    # Les trials antérieurs à l'ajout de `augmentation_factor` dans la search
+    # space tournaient avec la valeur forcée 0 → on retombe dessus si la clé
+    # manque (typiquement quand `study.best_params` pointe sur un vieux trial).
+    cfg.data.augmentation_factor = params.get("augmentation_factor", 0)
 
 
 def _per_label_metrics(probs: np.ndarray, labels: np.ndarray) -> dict:
@@ -132,22 +166,52 @@ def _per_label_metrics(probs: np.ndarray, labels: np.ndarray) -> dict:
     return out
 
 
-def _train_one_seed(params: dict, data_seed: int, trial_dir: Path) -> dict:
-    cfg = get_lightgbm_config()
+def _slice_raw_data(data: dict, idx: np.ndarray) -> dict:
+    """Sous-ensemble du dict de données par indices."""
+    return {
+        "spectra":   data["spectra"][idx],
+        "auxiliary": data["auxiliary"].iloc[idx].reset_index(drop=True),
+        "targets":   data["targets"].iloc[idx].reset_index(drop=True),
+    }
+
+
+def _train_on_split(
+    params: dict,
+    raw_data: dict,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    cfg_base,
+    work_dir: Optional[Path] = None,
+) -> dict:
+    """Entraîne un LightGBM sur les indices fournis et retourne les métriques.
+
+    Si `work_dir` est None, un dossier temporaire auto-nettoyé est utilisé →
+    aucun artefact ne reste sur disque (utile pour les trials Optuna).
+    """
+    cfg = copy.deepcopy(cfg_base)
     _apply_params_to_cfg(cfg, params)
-    cfg.data.random_seed = data_seed
-    cfg.paths.model_folder = str(trial_dir / "checkpoints")
-    cfg.results_folder = str(trial_dir / "results")
 
-    train_loader, val_loader, _ = build_dataloaders(cfg)
-    model = build_model(cfg, spectrum_length=0, auxiliary_dim=0)
-    trainer = _select_trainer(model, train_loader, val_loader, cfg)
-    result = trainer.train()
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="lgbm_optuna_") if work_dir is None else None
+    if tmp_ctx is not None:
+        work_dir = Path(tmp_ctx.name)
+    cfg.paths.model_folder = str(work_dir / "checkpoints")
+    cfg.results_folder = str(work_dir / "results")
 
-    val_probs    = np.asarray(result["val_probs"],    dtype=np.float32)
-    val_labels   = np.asarray(result["val_labels"],   dtype=np.float32)
-    train_probs  = np.asarray(result["train_probs"],  dtype=np.float32)
-    train_labels = np.asarray(result["train_labels"], dtype=np.float32)
+    try:
+        train_loader, val_loader, _ = build_dataloaders_from_indices(
+            raw_data, list(train_idx), list(val_idx), cfg,
+        )
+        model = build_model(cfg, spectrum_length=0, auxiliary_dim=0)
+        trainer = _select_trainer(model, train_loader, val_loader, cfg)
+        result = trainer.train()
+
+        val_probs    = np.asarray(result["val_probs"],    dtype=np.float32)
+        val_labels   = np.asarray(result["val_labels"],   dtype=np.float32)
+        train_probs  = np.asarray(result["train_probs"],  dtype=np.float32)
+        train_labels = np.asarray(result["train_labels"], dtype=np.float32)
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
     val_m   = _per_label_metrics(val_probs,   val_labels)
     train_m = _per_label_metrics(train_probs, train_labels)
@@ -166,7 +230,31 @@ def _train_one_seed(params: dict, data_seed: int, trial_dir: Path) -> dict:
         "train_mcc_nuage":     train_m["mcc_nuage"],
         "gap_eau":             train_m["mcc_eau"]   - val_m["mcc_eau"],
         "gap_nuage":           train_m["mcc_nuage"] - val_m["mcc_nuage"],
+        "_val_probs":          val_probs,
+        "_val_labels":         val_labels,
     }
+
+
+def _stratify_pool(targets_df) -> np.ndarray:
+    """Étiquette combinée eau_nuage pour StratifiedKFold (4 classes)."""
+    return (targets_df["eau"].astype(str) + "_" + targets_df["nuage"].astype(str)).values
+
+
+def _get_or_create_test_split(
+    raw_data: dict, test_ratio: float, seed: int, cache_path: Path,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Réserve un hold-out test stable et persistant. Optuna ne le voit JAMAIS."""
+    if cache_path.exists():
+        loaded = np.load(cache_path)
+        return loaded["pool_idx"], loaded["test_idx"]
+    n = len(raw_data["spectra"])
+    strat = _stratify_pool(raw_data["targets"])
+    pool_idx, test_idx = train_test_split(
+        np.arange(n), test_size=test_ratio, stratify=strat, random_state=seed,
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, pool_idx=pool_idx, test_idx=test_idx)
+    return pool_idx, test_idx
 
 
 def _aggregate_runs(runs: List[dict]) -> Dict[str, float]:
@@ -182,32 +270,41 @@ def _aggregate_runs(runs: List[dict]) -> Dict[str, float]:
 
 def _objective(
     trial: optuna.Trial,
-    base_output_dir: Path,
-    base_seed: int,
-    seeds_per_trial: int,
+    cfg_base,
+    pool_data: dict,
+    folds: List[Tuple[np.ndarray, np.ndarray]],
     objective_metric: str,
     gap_penalty: float,
 ) -> float:
     params = _suggest_hyperparams(trial)
-    trial_dir = base_output_dir / f"trial_{trial.number:04d}"
 
     runs: List[dict] = []
-    for i in range(seeds_per_trial):
-        data_seed = base_seed + 1000 * i
-        run = _train_one_seed(params, data_seed, trial_dir / f"seed_{i}")
-        runs.append(run)
+    # Pendant un trial on tait la log détaillée de l'entraîneur LightGBM :
+    # 50 trials × 3 folds × ~5 lignes par run sinon, illisible.
+    with _silence_loggers(("models.LightGBM.LightGBM",)):
+        for i, (train_idx, val_idx) in enumerate(folds):
+            # work_dir=None → artefacts dans un tmpdir auto-nettoyé.
+            # Seules les métriques (renvoyées) finissent dans la DB Optuna.
+            run = _train_on_split(
+                params, pool_data, train_idx, val_idx, cfg_base, work_dir=None,
+            )
+            runs.append(run)
 
-        # Pruning intermédiaire : si la perf moyenne courante est très mauvaise,
-        # on coupe avant de faire les seeds suivants.
-        running_mean = float(np.mean([r["val_mcc_mean"] for r in runs]))
-        trial.report(running_mean, step=i)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+            # Pruning intermédiaire : si la perf moyenne courante est très
+            # mauvaise, on coupe avant de faire les folds suivants.
+            running_mean = float(np.mean([r["val_mcc_mean"] for r in runs]))
+            trial.report(running_mean, step=i)
+            if trial.should_prune():
+                logger.info("Trial #%04d pruned après %d/%d folds (running mean %.4f)",
+                            trial.number, i + 1, len(folds), running_mean)
+                raise optuna.TrialPruned()
 
-    agg = _aggregate_runs(runs)
+    # On exclut les clés "_*" (probs/labels bruts) de l'agrégation
+    runs_for_agg = [{k: v for k, v in r.items() if not k.startswith("_")} for r in runs]
+    agg = _aggregate_runs(runs_for_agg)
     for k, v in agg.items():
         trial.set_user_attr(k, v)
-    trial.set_user_attr("seeds_per_trial", seeds_per_trial)
+    trial.set_user_attr("cv_folds", len(folds))
     trial.set_user_attr("gap_penalty", gap_penalty)
 
     base_value = agg.get(objective_metric)
@@ -221,13 +318,54 @@ def _objective(
     trial.set_user_attr("objective_raw", base_value)
     trial.set_user_attr("objective_final", final_value)
 
-    print(
-        f"\n>> Trial {trial.number:04d} | "
-        f"obj={final_value:.4f} (raw={base_value:.4f}, gap_pen={gap_penalty * gap_mean:.4f}) "
-        f"| eau val={agg['val_mcc_eau_mean']:.3f} (gap {agg['gap_eau_mean']:+.3f}) "
-        f"| nuage val={agg['val_mcc_nuage_mean']:.3f} (gap {agg['gap_nuage_mean']:+.3f})"
+    logger.info(
+        "Trial #%04d | folds=%d aug=%d pca=%s | obj=%.4f (raw=%.4f, pen=%.4f) "
+        "| eau %.3f (gap %+.3f) | nuage %.3f (gap %+.3f)",
+        trial.number, len(folds),
+        params.get("augmentation_factor", 0),
+        params.get("pca_components", "off") if params.get("use_pca") else "off",
+        final_value, base_value, gap_penalty * gap_mean,
+        agg["val_mcc_eau_mean"], agg["gap_eau_mean"],
+        agg["val_mcc_nuage_mean"], agg["gap_nuage_mean"],
     )
     return final_value
+
+
+def _retrain_and_eval_test(
+    best_params: dict,
+    raw_data: dict,
+    pool_idx: np.ndarray,
+    test_idx: np.ndarray,
+    cfg_base,
+    work_dir: Path,
+) -> dict:
+    """Réentraîne avec les meilleurs params sur tout le pool, évalue sur le hold-out test.
+
+    Le test n'a JAMAIS été vu par Optuna : c'est le rapport honnête final.
+    """
+    logger.info("=" * 90)
+    logger.info("RÉ-ENTRAÎNEMENT FINAL SUR POOL + ÉVALUATION SUR HOLD-OUT TEST")
+    logger.info("=" * 90)
+    run = _train_on_split(
+        best_params, raw_data, pool_idx, test_idx, cfg_base, work_dir=work_dir,
+    )
+    val_probs = run.pop("_val_probs", None)
+    val_labels = run.pop("_val_labels", None)
+
+    logger.info("Test hold-out (n=%d) :", len(test_idx))
+    logger.info("  MCC eau   %.4f  (opt %.4f @ t=%.2f)  gap %+.4f",
+                run["val_mcc_eau"], run["val_mcc_eau_best"],
+                run["best_threshold_eau"], run["gap_eau"])
+    logger.info("  MCC nuage %.4f  (opt %.4f @ t=%.2f)  gap %+.4f",
+                run["val_mcc_nuage"], run["val_mcc_nuage_best"],
+                run["best_threshold_nuage"], run["gap_nuage"])
+    logger.info("  MCC mean  %.4f", run["val_mcc_mean"])
+    logger.info("=" * 90)
+
+    report = {k: v for k, v in run.items() if not k.startswith("_")}
+    if val_probs is not None and val_labels is not None:
+        report["n_test_samples"] = int(len(test_idx))
+    return report
 
 
 def _best_by(study: optuna.Study, key: str) -> optuna.trial.FrozenTrial | None:
@@ -254,7 +392,7 @@ def _trial_to_dict(trial: optuna.trial.FrozenTrial | None) -> dict:
 def _analyze_study(study: optuna.Study, output_dir: Path, objective_metric: str) -> None:
     finished = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not finished:
-        print("Aucun trial complété, pas d'analyse possible.")
+        logger.warning("Aucun trial complété, pas d'analyse possible.")
         return
 
     bests = {
@@ -275,27 +413,28 @@ def _analyze_study(study: optuna.Study, output_dir: Path, objective_metric: str)
     gaps_eau   = [t.user_attrs.get("gap_eau_mean",   0.0) for t in finished]
     gaps_nuage = [t.user_attrs.get("gap_nuage_mean", 0.0) for t in finished]
 
-    print("\n" + "=" * 90)
-    print("ANALYSE DES TRIALS")
-    print("=" * 90)
+    logger.info("=" * 90)
+    logger.info("ANALYSE DES TRIALS")
+    logger.info("=" * 90)
     for tag, trial in bests.items():
         if trial is None:
             continue
         ua = trial.user_attrs
-        print(f"\n[{tag}] trial #{trial.number}")
-        print(f"  val MCC eau    : {ua.get('val_mcc_eau_mean', 0):.4f} "
-              f"(gap {ua.get('gap_eau_mean', 0):+.4f})")
-        print(f"  val MCC nuage  : {ua.get('val_mcc_nuage_mean', 0):.4f} "
-              f"(gap {ua.get('gap_nuage_mean', 0):+.4f})")
-        print(f"  val MCC mean   : {ua.get('val_mcc_mean_mean', 0):.4f}")
+        logger.info(
+            "[%-15s] #%d | eau %.4f (gap %+.4f) | nuage %.4f (gap %+.4f) | mean %.4f",
+            tag, trial.number,
+            ua.get("val_mcc_eau_mean", 0), ua.get("gap_eau_mean", 0),
+            ua.get("val_mcc_nuage_mean", 0), ua.get("gap_nuage_mean", 0),
+            ua.get("val_mcc_mean_mean", 0),
+        )
 
-    print("\n" + "-" * 90)
-    print(f"Stats sur {len(finished)} trials complétés :")
-    print(f"  val MCC eau    : moy {mean(eaus):.4f} ± {pstdev(eaus):.4f}")
-    print(f"  val MCC nuage  : moy {mean(nuages):.4f} ± {pstdev(nuages):.4f}")
-    print(f"  gap train-val eau   : moy {mean(gaps_eau):+.4f} ± {pstdev(gaps_eau):.4f}")
-    print(f"  gap train-val nuage : moy {mean(gaps_nuage):+.4f} ± {pstdev(gaps_nuage):.4f}")
-    print("=" * 90)
+    logger.info("-" * 90)
+    logger.info("Stats sur %d trials complétés :", len(finished))
+    logger.info("  val MCC eau    : moy %.4f ± %.4f", mean(eaus), pstdev(eaus))
+    logger.info("  val MCC nuage  : moy %.4f ± %.4f", mean(nuages), pstdev(nuages))
+    logger.info("  gap train-val eau   : moy %+.4f ± %.4f", mean(gaps_eau), pstdev(gaps_eau))
+    logger.info("  gap train-val nuage : moy %+.4f ± %.4f", mean(gaps_nuage), pstdev(gaps_nuage))
+    logger.info("=" * 90)
 
     analysis = {
         "objective_metric": objective_metric,
@@ -315,17 +454,20 @@ def _analyze_study(study: optuna.Study, output_dir: Path, objective_metric: str)
         df = study.trials_dataframe()
         df.to_csv(output_dir / "trials.csv", index=False)
     except Exception as ex:
-        print(f"(warn) Impossible d'écrire trials.csv : {ex}")
+        logger.warning("Impossible d'écrire trials.csv : %s", ex)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Optuna search LightGBM (persistent)")
     parser.add_argument("--trials", type=int, default=50)
-    parser.add_argument("--timeout", type=int, default=3600,
+    parser.add_argument("--timeout", type=int, default=36000,
                         help="Limite en secondes (défaut: 1h)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--seeds-per-trial", type=int, default=3,
-                        help="Splits stratifiés moyennés par trial")
+    parser.add_argument("--cv-folds", type=int, default=3,
+                        help="Nombre de folds stratifiés par trial (CV K-fold)")
+    parser.add_argument("--test-ratio", type=float, default=0.15,
+                        help="Fraction des données réservée en hold-out test "
+                             "(jamais vue par Optuna). Défaut 15 %%.")
     parser.add_argument("--objective", type=str, default="val_mcc_mean_mean",
                         choices=OBJECTIVE_CHOICES)
     parser.add_argument("--gap-penalty", type=float, default=0.5,
@@ -336,8 +478,11 @@ def main() -> None:
                         default=str(_HERE / "optuna_search"),
                         help="Chemin du fichier SQLite des trials")
     parser.add_argument("--output-dir", type=str,
-                        default=str(_HERE / "optuna_search"),
-                        help="Dossier pour best_params.json / trials.csv / analysis.json")
+                        default=str(_HERE / "results" / "optuna"),
+                        help="Dossier pour best_params.json / trials.csv / analysis.json "
+                             "(distinct du fichier SQLite)")
+    parser.add_argument("--skip-final-test", action="store_true",
+                        help="Ne pas réentraîner sur le pool ni évaluer sur le hold-out test à la fin.")
     args = parser.parse_args()
 
     setup_logging()
@@ -347,6 +492,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     storage_path = Path(args.storage_path)
     storage_path.parent.mkdir(parents=True, exist_ok=True)
+    if storage_path.is_dir():
+        raise SystemExit(
+            f"[ERREUR] {storage_path} existe et est un dossier. SQLite a besoin "
+            f"d'un fichier à ce chemin. Supprime-le ou utilise --storage-path."
+        )
 
     storage_url = f"sqlite:///{storage_path.as_posix()}"
     study = optuna.create_study(
@@ -358,19 +508,43 @@ def main() -> None:
         pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=1),
     )
 
+    # ── Données + hold-out test (stable, mis en cache à côté de la DB) ────
+    cfg_base = get_lightgbm_config()
+    raw_data = load_raw_data(cfg_base)
+    test_cache = output_dir / "test_split.npz"
+    pool_idx, test_idx = _get_or_create_test_split(
+        raw_data, args.test_ratio, args.seed, test_cache,
+    )
+    pool_data = _slice_raw_data(raw_data, pool_idx)
+    strat = _stratify_pool(pool_data["targets"])
+    skf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
+    folds = [
+        (np.asarray(tr, dtype=np.int64), np.asarray(va, dtype=np.int64))
+        for tr, va in skf.split(np.zeros(len(pool_data["spectra"])), strat)
+    ]
+
     n_done = len([t for t in study.trials
                   if t.state == optuna.trial.TrialState.COMPLETE])
-    print(f"Étude « {args.study_name} »  |  storage: {storage_url}")
-    print(f"Trials déjà complétés : {n_done}  |  Cibles ajoutées : {args.trials}")
-    print(f"Objectif : {args.objective}  |  Gap penalty : {args.gap_penalty}")
-    print(f"Seeds par trial : {args.seeds_per_trial}  |  Timeout : {args.timeout}s\n")
+    logger.info("=" * 90)
+    logger.info("OPTUNA LIGHTGBM | étude « %s »", args.study_name)
+    logger.info("=" * 90)
+    logger.info("Storage   : %s", storage_url)
+    logger.info("Trials    : %d déjà complétés  →  +%d à ajouter (timeout %ds)",
+                n_done, args.trials, args.timeout)
+    logger.info("Objectif  : %s  |  gap penalty : %.2f", args.objective, args.gap_penalty)
+    logger.info("CV        : %d folds sur pool=%d  (hold-out test=%d)",
+                args.cv_folds, len(pool_idx), len(test_idx))
+    logger.info("=" * 90)
+    # Optuna lui-même log à INFO chaque fin de trial ("Trial X finished..."),
+    # ce qui doublonne notre ligne. On le met à WARNING.
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     study.optimize(
         lambda trial: _objective(
             trial,
-            base_output_dir=output_dir,
-            base_seed=args.seed,
-            seeds_per_trial=args.seeds_per_trial,
+            cfg_base=cfg_base,
+            pool_data=pool_data,
+            folds=folds,
             objective_metric=args.objective,
             gap_penalty=args.gap_penalty,
         ),
@@ -379,36 +553,59 @@ def main() -> None:
         gc_after_trial=True,
     )
 
-    print("\nMeilleurs hyperparamètres :")
-    print(json.dumps(study.best_params, indent=2))
-    print(f"\nBest value ({args.objective} pénalisé) : {study.best_value:.4f}")
+    logger.info("=" * 90)
+    logger.info("MEILLEUR TRIAL")
+    logger.info("=" * 90)
+    logger.info("Best value (%s pénalisé) : %.4f  |  trial #%d",
+                args.objective, study.best_value, study.best_trial.number)
+    for k, v in study.best_params.items():
+        if isinstance(v, float):
+            logger.info("  %-22s : %.6g", k, v)
+        else:
+            logger.info("  %-22s : %s", k, v)
 
     best_trial = study.best_trial
-    with open(output_dir / "best_params.json", "w") as f:
-        json.dump(
-            {
-                "objective_metric":   args.objective,
-                "gap_penalty":        args.gap_penalty,
-                "best_params":        study.best_params,
-                "best_value":         study.best_value,
-                "best_trial_number":  best_trial.number,
-                "best_trial_metrics": dict(best_trial.user_attrs),
-                "study_name":         args.study_name,
-                "storage":            storage_url,
-                "n_trials_total":     len(study.trials),
-                "seeds_per_trial":    args.seeds_per_trial,
-                "seed":               args.seed,
-            },
-            f,
-            indent=2,
+    best_params_payload = {
+        "objective_metric":   args.objective,
+        "gap_penalty":        args.gap_penalty,
+        "best_params":        study.best_params,
+        "best_value":         study.best_value,
+        "best_trial_number":  best_trial.number,
+        "best_trial_metrics": dict(best_trial.user_attrs),
+        "study_name":         args.study_name,
+        "storage":            storage_url,
+        "n_trials_total":     len(study.trials),
+        "cv_folds":           args.cv_folds,
+        "test_ratio":         args.test_ratio,
+        "n_pool":             int(len(pool_idx)),
+        "n_test":             int(len(test_idx)),
+        "seed":               args.seed,
+    }
+
+    # ── Évaluation finale sur le hold-out test (jamais vu par Optuna) ────
+    if not args.skip_final_test:
+        test_report = _retrain_and_eval_test(
+            best_params=study.best_params,
+            raw_data=raw_data,
+            pool_idx=pool_idx,
+            test_idx=test_idx,
+            cfg_base=cfg_base,
+            work_dir=output_dir / "final_holdout",
         )
+        best_params_payload["holdout_test_metrics"] = test_report
+
+    with open(output_dir / "best_params.json", "w") as f:
+        json.dump(best_params_payload, f, indent=2)
 
     _analyze_study(study, output_dir, args.objective)
 
-    print(f"\nStorage SQLite   : {storage_path}")
-    print(f"Best params      : {output_dir / 'best_params.json'}")
-    print(f"Analyse          : {output_dir / 'analysis.json'}")
-    print(f"Trials CSV       : {output_dir / 'trials.csv'}")
+    logger.info("-" * 90)
+    logger.info("Sorties :")
+    logger.info("  storage SQLite   : %s", storage_path)
+    logger.info("  best params JSON : %s", output_dir / "best_params.json")
+    logger.info("  analyse JSON     : %s", output_dir / "analysis.json")
+    logger.info("  trials CSV       : %s", output_dir / "trials.csv")
+    logger.info("  test split cache : %s", test_cache)
 
 
 if __name__ == "__main__":

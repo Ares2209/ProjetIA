@@ -16,3 +16,4 @@ models/*/checkpoints/
 models/*/results/
 models/*/runs/
 
+models/*/results/optuna/

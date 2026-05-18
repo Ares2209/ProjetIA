@@ -8,6 +8,7 @@ and converts each sample to engineered numeric features.
 from __future__ import annotations
 
 import json
+import logging
 import pickle
 import random
 import time
@@ -21,6 +22,9 @@ from sklearn.decomposition import PCA
 
 from training.metrique import MetricsCalculator
 from training.utils import NumpyEncoder
+
+
+logger = logging.getLogger(__name__)
 
 
 LABEL_NAMES = ("eau", "nuage")
@@ -422,16 +426,14 @@ class LightGBMTrainer:
         )
         self.feature_names = feature_names
 
-        print("\n" + "=" * 90)
-        print("DEBUT DE L'ENTRAINEMENT LIGHTGBM")
-        print("=" * 90)
-        print(f"  Train shape:        {x_train.shape}")
-        print(f"  Val shape:          {x_val.shape}")
-        print(f"  Features:           {len(feature_names)}")
-        print(f"  N estimators:       {self.config.model.n_estimators}")
-        print(f"  Learning rate:      {self.config.training.learning_rate}")
-        print(f"  Early stopping:     {self.config.training.patience}")
-        print("=" * 90 + "\n")
+        logger.info(
+            "LightGBM | train %s | val %s | %d features | n_estim=%d  lr=%.4g  "
+            "patience=%d  aug=%d  pca=%s",
+            tuple(x_train.shape), tuple(x_val.shape), len(feature_names),
+            self.config.model.n_estimators, self.config.training.learning_rate,
+            self.config.training.patience, self.config.data.augmentation_factor,
+            f"{self.pca.n_components_}" if self.pca is not None else "off",
+        )
 
         x_train_frame = _as_frame(x_train, feature_names)
         x_val_frame = _as_frame(x_val, feature_names)
@@ -439,7 +441,7 @@ class LightGBMTrainer:
         val_probs = np.zeros_like(y_val, dtype=np.float32)
 
         for idx, label_name in enumerate(LABEL_NAMES):
-            print(f"-- Entrainement LightGBM pour {label_name} --")
+            t0 = time.time()
             model = self._make_model()
             model.fit(
                 x_train_frame,
@@ -450,14 +452,22 @@ class LightGBMTrainer:
                 callbacks=[
                     lgb.early_stopping(
                         stopping_rounds=self.config.training.patience,
-                        verbose=True,
+                        verbose=False,
                     ),
-                    lgb.log_evaluation(period=50),
                 ],
             )
             self.models[label_name] = model
             train_probs[:, idx] = model.predict_proba(x_train_frame)[:, 1]
             val_probs[:, idx] = model.predict_proba(x_val_frame)[:, 1]
+            best_iter = model.best_iteration_ or model.n_estimators_
+            val_evals = (model.evals_result_ or {}).get("val", {})
+            ll_series = val_evals.get("binary_logloss") or []
+            final_ll = ll_series[best_iter - 1] if 0 < best_iter <= len(ll_series) else float("nan")
+            logger.info(
+                "  → %-6s | best_iter=%4d/%d  val_logloss=%.4f  (%.1fs)",
+                label_name, best_iter, self.config.model.n_estimators,
+                final_ll, time.time() - t0,
+            )
 
         primary = PRIMARY_LABEL_INDEX
         threshold = self.config.training.classification_threshold
@@ -482,6 +492,14 @@ class LightGBMTrainer:
         )
         val_metrics["best_threshold"] = best_t
         val_metrics["mcc_at_best_threshold"] = mcc_at_best_t
+
+        val_metrics_per_label: Dict[str, Dict[str, float]] = {}
+        for idx, label_name in enumerate(LABEL_NAMES):
+            m = _metrics_from_probs(y_val[:, idx], val_probs[:, idx], threshold)
+            bt, mcc_bt = _find_optimal_threshold(y_val[:, idx], val_probs[:, idx])
+            m["best_threshold"] = bt
+            m["mcc_at_best_threshold"] = mcc_bt
+            val_metrics_per_label[label_name] = m
 
         history, checkpoint_iters = _build_iteration_history(
             self.models,
@@ -517,15 +535,20 @@ class LightGBMTrainer:
         )
 
         elapsed = time.time() - start
-        print("\n" + "=" * 90)
-        print("RESUME LIGHTGBM")
-        print("=" * 90)
-        print(f"  Val loss:           {val_metrics['loss']:.4f}")
-        print(f"  Val MCC (nuage):    {val_metrics['mcc']:.4f}")
-        print(f"  Val MCC optimal:    {mcc_at_best_t:.4f} @ threshold={best_t:.2f}")
-        print(f"  Val F1 (nuage):     {val_metrics['f1']:.4f}")
-        print(f"  Val AUROC (nuage):  {val_metrics['auroc']:.4f}")
-        print("=" * 90 + "\n")
+        # Log par label (le résumé principal côté primary est géré par
+        # training.utils.log_training_summary, appelé après train()).
+        mcc_means: List[float] = []
+        for label_name, m in val_metrics_per_label.items():
+            mcc_means.append(m["mcc"])
+            logger.info(
+                "Val %-6s | MCC %.4f (opt %.4f @ t=%.2f)  F1 %.4f  AUROC %.4f",
+                label_name, m["mcc"], m["mcc_at_best_threshold"],
+                m["best_threshold"], m["f1"], m["auroc"],
+            )
+        logger.info(
+            "Val mean MCC (eau, nuage) : %.4f  |  durée %.1fs",
+            float(np.mean(mcc_means)), elapsed,
+        )
 
         n_checkpoints_built = len(history.get("val_mcc", []))
         final_epoch = max(1, n_checkpoints_built)
